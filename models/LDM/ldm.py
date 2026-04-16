@@ -28,6 +28,8 @@ class LDMMolDesign(nn.Module):
             h_loss_weight=None,
             std=10.0,
             is_aa_corrupt_ratio=0.1,
+            cfg_dropout_ratio=0.4,
+            guidance_scale=1.5,
             diffusion_opt={}
         ):
         super().__init__()
@@ -48,9 +50,14 @@ class LDMMolDesign(nn.Module):
         self.position_encoding = SinusoidalPositionEmbedding(hidden_size)
         self.is_aa_embed = nn.Embedding(2, hidden_size) # is or is not standard amino acid
 
+        # terminal relative position projection
+        self.term_pos_proj = nn.Linear(15, hidden_size)
+        self.cfg_dropout_ratio = cfg_dropout_ratio
+        self.guidance_scale = guidance_scale
+
         # condition embedding MLP
         self.cond_mlp = MLP(
-            input_size=3 * hidden_size, # [position, topo, is_aa]
+            input_size=4 * hidden_size, # [position, topo, is_aa, term_pos]
             hidden_size=hidden_size,
             output_size=hidden_size,
             n_layers=3,
@@ -84,6 +91,7 @@ class LDMMolDesign(nn.Module):
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
+            term_rel_pos,   # [Nblock, 15], relative position to N-term and C-term
         ):
         '''
             L: [bs, 3, 3], cholesky decomposition of the covariance matrix \Sigma = LL^T
@@ -111,8 +119,19 @@ class LDMMolDesign(nn.Module):
             torch.where(corrupt_mask, torch.zeros_like(is_aa), is_aa).long()
         )
 
+        # term_rel_pos_embedding
+        batch_size = lengths.shape[0]
+        cfg_mask = torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio  # [batch_size]
+        cfg_mask = cfg_mask[batch_ids]  # [Nblock], broadcast to blocks
+        term_pos_embedding = self.term_pos_proj(term_rel_pos)
+        term_pos_embedding = torch.where(
+            cfg_mask.unsqueeze(-1),  # [Nblock, 1]
+            torch.zeros_like(term_pos_embedding),
+            term_pos_embedding
+        )
+
         # condition embedding
-        cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
+        cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding, term_pos_embedding], dim=-1))
 
         loss_dict = self.diffusion.forward(
             H_0=Zh,
@@ -190,6 +209,7 @@ class LDMMolDesign(nn.Module):
             block_lengths,  # [Nblock], number of atoms in each block
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
+            term_rel_pos,   # [Nblock, 15], relative position to N-term and C-term
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -235,14 +255,21 @@ class LDMMolDesign(nn.Module):
 
         # is aa embedding
         is_aa_embedding = self.is_aa_embed(is_aa.long())
+
+        # terminal relative position embedding
+        term_pos_embedding = self.term_pos_proj(term_rel_pos)
+        term_pos_embedding_uncond = torch.zeros_like(term_pos_embedding)
         
         # condition embedding
-        cond_embedding = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding], dim=-1))
+        cond_embedding_full = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding, term_pos_embedding], dim=-1))
+        cond_embedding_null = self.cond_mlp(torch.cat([position_embedding, topo_embedding, is_aa_embedding, term_pos_embedding_uncond], dim=-1))
         
         traj = self.diffusion.sample(
             H=Zh,
             X=Zx,
-            cond_embedding=cond_embedding,
+            cond_embedding=cond_embedding_full,
+            cond_embedding_uncond=cond_embedding_null,
+            guidance_scale=self.guidance_scale,
             chain_ids=chain_ids,
             generate_mask=generate_mask,
             lengths=lengths,

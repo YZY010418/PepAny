@@ -136,6 +136,8 @@ class CondIterAutoEncoder(nn.Module):
             kl_on_pocket=False,         # whether to exert kl regularization also on pocket nodes
             discrete_timestep=False,
             default_num_steps=10,
+            cfg_dropout_ratio=0.4,       
+            guidance_scale=1.5,
         ) -> None:
         super().__init__()
         self.encoder = create_net(encoder_type, hidden_size, edge_size, encoder_opt)
@@ -150,7 +152,11 @@ class CondIterAutoEncoder(nn.Module):
         self.dec_pos_embedding = SinusoidalPositionEmbedding(hidden_size)
         self.dec_latent2hidden = nn.Linear(latent_size, hidden_size)
         self.dec_time_embedding = SinusoidalTimeEmbeddings(hidden_size)
-        self.dec_input_linear = nn.Linear(hidden_size * 3 + latent_size, hidden_size) # atom, time, position, latent
+        self.dec_term_pos_proj = nn.Linear(15, hidden_size)
+        self.dec_input_linear = nn.Linear(hidden_size * 4 + latent_size, hidden_size) # atom, time, position, term_rel, latent
+
+        self.cfg_dropout_ratio = cfg_dropout_ratio
+        self.guidance_scale = guidance_scale
 
         self.mask_embedding = nn.Parameter(torch.randn(latent_size), requires_grad=True)
 
@@ -204,6 +210,7 @@ class CondIterAutoEncoder(nn.Module):
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
             warmup_progress=1.0, # increasing KL from 0% to 100% for training stability
+            term_rel_pos=None,
             **kwargs
         ):
         # backup ground truth
@@ -247,8 +254,22 @@ class CondIterAutoEncoder(nn.Module):
         topo_edge_type = torch.cat([topo_edge_type, inter_topo_edge_type[inter_topo_edge_select_mask]], dim=0)
 
         topo_edge_attr = self.atom_edge_embedding(topo_edge_type)
+
+        # Apply CFG dropout to terminal position condition
+        if term_rel_pos is not None and self.training:
+            batch_size = lengths.shape[0]
+            cfg_mask = torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio
+            cfg_mask = cfg_mask[batch_ids]  # [Nblock], broadcast to blocks
+            term_rel_pos = torch.where(
+                cfg_mask.unsqueeze(-1),
+                torch.zeros_like(term_rel_pos),
+                term_rel_pos
+            )
+        else:
+            term_rel_pos_input = term_rel_pos
+
         # decode structure
-        H_t, X_next = self.decode_structure(Zh, X_t, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t)
+        H_t, X_next = self.decode_structure(Zh, X_t, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t, term_rel_pos=term_rel_pos)
         pred_vector = X_next - X_t
         X_final = X_t + pred_vector * t[:, None] # for local neighborhood
         # decode inter-block bonds
@@ -388,7 +409,7 @@ class CondIterAutoEncoder(nn.Module):
         pred_block_logits = self.block_type_mlp(block_h)
         return pred_block_logits
 
-    def decode_structure(self, Zh, X, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t):
+    def decode_structure(self, Zh, X, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t, term_rel_pos=None):
         '''
             Args:
                 Zh: [Nblock, latent_size]
@@ -406,7 +427,7 @@ class CondIterAutoEncoder(nn.Module):
         edges, edge_type = self.get_edges(batch_ids, chain_ids, X, block_ids, None, True, True)
         edge_attr = self.edge_embedding(edge_type)
         H = self.dec_input_linear(torch.cat([
-            self.dec_atom_embedding(A), self.dec_time_embedding(t), self.dec_pos_embedding(position_ids[block_ids]), Zh[block_ids]
+            self.dec_atom_embedding(A), self.dec_time_embedding(t), self.dec_pos_embedding(position_ids[block_ids]), Zh[block_ids], self.dec_term_pos_proj(term_rel_pos[block_ids]) if term_rel_pos is not None else torch.zeros_like(Zh[block_ids])
         ], dim=-1)) # [Natom, hidden_size]
         H_t, X_next = self.decoder(H, X, block_ids, batch_ids, edges, edge_attr, topo_edges, topo_edge_attr) # [Natom', hidden_size], [Natom', 3]
         
@@ -733,6 +754,8 @@ class CondIterAutoEncoder(nn.Module):
         fixseq=False,       # whether to only predict the structure
         return_x_only=False,# return x only (used in validation)
         topo_generate_mask=None,
+        term_rel_pos=None,
+        guidance_scale=1.5,
         **kwargs
     ):
         
@@ -794,11 +817,22 @@ class CondIterAutoEncoder(nn.Module):
 
         for i in range(n_iter):
             t = (1.0 - i * span) * torch.ones_like(block_ids, dtype=torch.float)
-            H_t, X_next = self.decode_structure(Zh, X_t, A, position_ids, topo_edges_add, topo_edge_attr_add, chain_ids, batch_ids, block_ids, t)
-            pred_vector = torch.where(
-                X_gen_mask,
-                X_next - X_t,
-                torch.zeros_like(X_t))
+            # Decode with condition
+            H_t_cond, X_next_cond = self.decode_structure(
+                Zh, X_t, A, position_ids, topo_edges_add, topo_edge_attr_add, 
+                chain_ids, batch_ids, block_ids, t, term_rel_pos=term_rel_pos
+            )
+            pred_vector_cond = X_next_cond - X_t
+            
+            # Decode without condition (unconditioned)
+            H_t_uncond, X_next_uncond = self.decode_structure(
+                Zh, X_t, A, position_ids, topo_edges_add, topo_edge_attr_add, 
+                chain_ids, batch_ids, block_ids, t, term_rel_pos=None
+            )
+            pred_vector_uncond = X_next_uncond - X_t
+            
+            # CFG: blend velocities
+            pred_vector = pred_vector_uncond + self.guidance_scale * (pred_vector_cond - pred_vector_uncond)
             X_t = X_t + pred_vector * span # update
             X_t = _avoid_clash(A, X_t, batch_ids, block_ids, chain_ids, generate_mask, is_aa)
             all_vectors.append(pred_vector)

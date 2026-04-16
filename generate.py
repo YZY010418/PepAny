@@ -59,13 +59,14 @@ def clamp_coord(coord):
     return new_coord
 
 
-def generate_wrapper(model, sample_opt={}):
+def generate_wrapper(model, sample_opt={}, guidance_scale=1.5):
     if isinstance(model, models.CondIterAutoEncoder):
         def wrapper(batch):
-            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(**batch)
+            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(**batch,guidance_scale=guidance_scale)
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):
+            sample_opt['guidance_scale'] = guidance_scale 
             res_tuple = model.sample(sample_opt=sample_opt, **batch)
             if len(res_tuple) == 6:
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = res_tuple
@@ -134,6 +135,7 @@ def main(args, opt_args):
     config = overwrite_values(config, opt_args)
     mode = config.get('sample_opt', {}).get('mode', 'codesign')
     struct_only = mode == 'fixseq'
+    guidance_scale = config.get('sample_opt', {}).get('guidance_scale', 1.5)
     # load model
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
@@ -173,7 +175,7 @@ def main(args, opt_args):
         batch = to_device(batch, device)
         
         with torch.no_grad():
-            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model, deepcopy(config.get('sample_opt', {})))(batch)
+            batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model, deepcopy(config.get('sample_opt', {})), guidance_scale=guidance_scale)(batch)
 
         vae_batch_list = []
         for S, X, A, ll, bonds, intra_bonds, (item_idx, n) in zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list):
@@ -210,7 +212,7 @@ def main(args, opt_args):
             model_autoencoder = getattr(model, 'autoencoder', model)
             with torch.no_grad():
                 if final_cycle: batch['topo_generate_mask'] = torch.zeros_like(batch['generate_mask'])
-                batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model_autoencoder, deepcopy(config.get('sample_opt', {})))(batch)
+                batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = generate_wrapper(model_autoencoder, deepcopy(config.get('sample_opt', {})), guidance_scale=guidance_scale)(batch)
             for S, X, A, ll, bonds, intra_bonds, (item_idx, n) in zip(batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds, batch_list):
                 cplx: Complex = deepcopy(test_set.get_raw_data(item_idx))
                 summary: Summary = deepcopy(test_set.get_summary(item_idx))

@@ -171,6 +171,8 @@ class FullDPM(nn.Module):
             chain_ids,
             generate_mask,
             lengths,
+            cond_embedding_uncond=None,
+            guidance_scale=1.5,
             pbar=False,
             # energy_func=None,
             # energy_lambda=0.01,
@@ -206,9 +208,20 @@ class FullDPM(nn.Module):
             beta = self.trans_x.get_timestamp(t).view(1).repeat(X_t.shape[0])
             t_tensor = torch.full([X_t.shape[0], ], fill_value=t, dtype=torch.long, device=X_t.device)
 
-            eps_H, eps_X = self.eps_net(
+            # Conditional prediction
+            eps_H_cond, eps_X_cond = self.eps_net(
                 H_t, X_t, cond_embedding, edges, edge_types, generate_mask, batch_ids, beta
             )
+
+            # CFG blending if unconditional embedding provided
+            if cond_embedding_uncond is not None:
+                eps_H_uncond, eps_X_uncond = self.eps_net(
+                    H_t, X_t, cond_embedding_uncond, edges, edge_types, generate_mask, batch_ids, beta
+                )
+                eps_H = eps_H_uncond + guidance_scale * (eps_H_cond - eps_H_uncond)
+                eps_X = eps_X_uncond + guidance_scale * (eps_X_cond - eps_X_uncond)
+            else:
+                eps_H, eps_X = eps_H_cond, eps_X_cond
 
             H_next = self.trans_h.denoise(H_t, eps_H, generate_mask, batch_ids, t_tensor)
             # X_next = self.trans_x.denoise(X_t, eps_X, generate_mask, batch_ids, t_tensor, guidance=energy_eps_X, guidance_weight=energy_lambda)
