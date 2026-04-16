@@ -2,4 +2,4 @@
 
 ## Introduction
 
-This is the repo for **CPSea-2** and **PepAny**.
+**PepAny** is an example of a possible application of CPSea-2. 
