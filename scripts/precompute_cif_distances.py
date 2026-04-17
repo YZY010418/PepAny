@@ -7,7 +7,7 @@ to each ligand structure. At runtime, we can then quickly filter residues
 by thresholds without recalculating distances.
 
 Usage:
-    python3 scripts/precompute_cif_distances.py <cif_dir> [--output-dir <output_dir>]
+    python3 scripts/precompute_cif_distances.py <cif_dir> --output-dir <output_dir>
 
 Output files:
     <cif_file>.distances.pkl - pickle file with distances
@@ -128,8 +128,8 @@ def main():
         description='Pre-compute residue-ligand distances for fast pocket detection'
     )
     parser.add_argument('cif_dir', help='Directory containing .cif.gz files')
-    parser.add_argument('--output-dir', default=None,
-                       help='Output directory for .distances.pkl files (default: same as cif_dir)')
+    parser.add_argument('--output-dir', required=True,
+                       help='Output directory for .distances.pkl files')
     parser.add_argument('--pattern', default='*.cif.gz',
                        help='File pattern to match (default: *.cif.gz)')
     parser.add_argument(
@@ -148,7 +148,7 @@ def main():
     args = parser.parse_args()
     
     cif_dir = args.cif_dir
-    output_dir = args.output_dir or cif_dir
+    output_dir = args.output_dir
     
     if not os.path.isdir(cif_dir):
         print(f"Error: Directory not found: {cif_dir}")
@@ -205,6 +205,7 @@ def main():
     print("  dataset = DynamicCIFDataset(")
     print(f"    cif_dir='{cif_dir}',")
     print("    use_precomputed_distances=True,")
+    print(f"    precomputed_distances_dir='{output_dir}',")
     print("  )")
 
 

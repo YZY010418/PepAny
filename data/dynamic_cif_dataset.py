@@ -63,6 +63,7 @@ class DynamicCIFDataset:
         pocket_th_min: float = 10.0,
         pocket_th_max: float = 20.0,
         use_precomputed_distances: bool = False,
+        precomputed_distances_dir: Optional[str] = None,
         seed: int = 42,
         num_workers: int = 0,
     ):
@@ -81,6 +82,8 @@ class DynamicCIFDataset:
             use_precomputed_distances: If True, load pre-computed residue distances
                                       (much faster, requires preprocessing step)
                                       Files should be named: 8DTM_cluster0.distances.pkl
+            precomputed_distances_dir: Directory containing precomputed distance pickle files.
+                                       If None, no separate distance directory is used.
             seed: Random seed for reproducibility
             num_workers: For potential parallel loading (future use)
         """
@@ -88,6 +91,10 @@ class DynamicCIFDataset:
         self.pocket_th_min = pocket_th_min
         self.pocket_th_max = pocket_th_max
         self.use_precomputed_distances = use_precomputed_distances
+        self.precomputed_distances_dir = (
+            os.path.abspath(precomputed_distances_dir)
+            if precomputed_distances_dir is not None else None
+        )
         self.seed = seed
         self.num_workers = num_workers
         self.cluster = cluster
@@ -114,6 +121,10 @@ class DynamicCIFDataset:
         print(f"Found {len(self.cif_files)} CIF files")
         print(f"Pocket threshold range: [{pocket_th_min:.1f}, {pocket_th_max:.1f}] Å")
         print(f"Using precomputed distances: {use_precomputed_distances}")
+        if use_precomputed_distances:
+            print(f"Precomputed distances dir: {self.precomputed_distances_dir}")
+            if self.precomputed_distances_dir is None:
+                print("  Warning: precomputed_distances_dir is not set; falling back to on-the-fly pocket computation.")
         
         # Pre-compute ligand IDs for each CIF file
         self.cif_ligand_ids = {}
@@ -129,8 +140,8 @@ class DynamicCIFDataset:
                     
                     # Try to load precomputed distances
                     if use_precomputed_distances:
-                        dist_path = cif_path.replace('.cif.gz', '.distances.pkl').replace('.cif', '.distances.pkl')
-                        if os.path.exists(dist_path):
+                        dist_path = self._get_distance_path(cif_path)
+                        if dist_path is not None and os.path.exists(dist_path):
                             try:
                                 with open(dist_path, 'rb') as f:
                                     self.precomputed_distances[cif_path] = pickle.load(f)
@@ -175,6 +186,23 @@ class DynamicCIFDataset:
                 f"(replace={cluster_replace})"
             )
             self.update_epoch()
+
+    @staticmethod
+    def _get_distance_filename(cif_path: str) -> str:
+        base_name = os.path.basename(cif_path)
+        if base_name.endswith('.cif.gz'):
+            return base_name[:-7] + '.distances.pkl'
+        if base_name.endswith('.cif'):
+            return base_name[:-4] + '.distances.pkl'
+        return base_name + '.distances.pkl'
+
+    def _get_distance_path(self, cif_path: str) -> Optional[str]:
+        if self.precomputed_distances_dir is None:
+            return None
+        return os.path.join(
+            self.precomputed_distances_dir,
+            self._get_distance_filename(cif_path)
+        )
     
     def __len__(self) -> int:
         """Total number of CIF files. Each file can be sampled multiple times with different ligands."""
