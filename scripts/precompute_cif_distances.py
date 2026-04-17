@@ -7,12 +7,12 @@ to each ligand structure. At runtime, we can then quickly filter residues
 by thresholds without recalculating distances.
 
 Usage:
-    python3 precompute_distances.py <cif_dir> [--output-dir <output_dir>]
+    python3 scripts/precompute_cif_distances.py <cif_dir> [--output-dir <output_dir>]
 
 Output files:
     <cif_file>.distances.pkl - pickle file with distances
         Format: {
-            ligand_id: {residue_idx: min_distance, ...},
+            ligand_id: {residue_block_id: min_distance, ...},
             ...
         }
 """
@@ -20,25 +20,10 @@ Output files:
 import os
 import sys
 import pickle
-import gzip
 import argparse
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-
-def get_residue_atoms(block):
-    """Get CA coordinates from a block (residue)"""
-    for atom in block:
-        if atom.name == 'CA':
-            return np.array(atom.get_coord(), dtype=np.float32)
-    # Fallback: average of all atoms
-    coords = []
-    for atom in block:
-        coords.append(np.array(atom.get_coord(), dtype=np.float32))
-    if coords:
-        return np.mean(coords, axis=0)
-    return None
-
 
 def compute_distances_for_cif(cif_path, output_dir):
     """
@@ -59,6 +44,7 @@ def compute_distances_for_cif(cif_path, output_dir):
             extract_ligand_from_cif,
             get_ligand_ids_from_receptor
         )
+        from data.bioparse.interface import blocks_to_cb_coords
         
         # Parse receptor
         receptor = cif_to_complex(cif_path)
@@ -71,14 +57,9 @@ def compute_distances_for_cif(cif_path, output_dir):
         receptor_chain = list(receptor.id2idx.keys())[0]
         receptor_blocks = receptor[receptor_chain].blocks
         
-        # Get receptor residue coordinates (CA atoms)
-        receptor_coords = []
-        for block in receptor_blocks:
-            ca_coord = get_residue_atoms(block)
-            if ca_coord is not None:
-                receptor_coords.append(ca_coord)
-            else:
-                receptor_coords.append(np.zeros(3))
+        # Use the same representative block coordinates as runtime pocket detection:
+        # Cb/virtual-Cb for amino acids and center-of-mass for non-proteins.
+        receptor_coords = blocks_to_cb_coords(receptor_blocks).astype(np.float32)
         
         # Compute distances to each ligand
         distances_data = {}
@@ -89,26 +70,16 @@ def compute_distances_for_cif(cif_path, output_dir):
                 ligand_chain = list(ligand.id2idx.keys())[0]
                 ligand_blocks = ligand[ligand_chain].blocks
                 
-                # Get ligand atom coordinates (all atoms)
-                ligand_coords = []
-                for block in ligand_blocks:
-                    for atom in block:
-                        ligand_coords.append(np.array(atom.get_coord(), dtype=np.float32))
-                
-                if not ligand_coords:
+                if not ligand_blocks:
                     continue
                 
-                ligand_coords = np.array(ligand_coords)
+                ligand_coords = blocks_to_cb_coords(ligand_blocks).astype(np.float32)
                 
-                # Compute minimum distance from each residue to ligand atoms
+                # Compute the same block-level minimum distances used by compute_pocket().
                 residue_distances = {}
-                for res_idx, res_coord in enumerate(receptor_coords):
-                    if np.allclose(res_coord, 0):  # Empty residue
-                        residue_distances[res_idx] = float('inf')
-                    else:
-                        # Minimum distance from this residue to any ligand atom
-                        distances = np.linalg.norm(ligand_coords - res_coord, axis=1)
-                        residue_distances[res_idx] = float(np.min(distances))
+                for block, res_coord in zip(receptor_blocks, receptor_coords):
+                    distances = np.linalg.norm(ligand_coords - res_coord, axis=1)
+                    residue_distances[block.id] = float(np.min(distances))
                 
                 distances_data[ligand_id] = residue_distances
                 

@@ -4,6 +4,7 @@ from .dataset_wrapper import MixDatasetWrapper
 from .peptide import PeptideDataset
 from .molecule import MoleculeDataset
 from .antibody import AntibodyDataset
+from .dynamic_cif_dataset import DynamicCIFDataset
 
 import torch
 from torch.utils.data import DataLoader

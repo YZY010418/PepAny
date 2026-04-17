@@ -12,7 +12,6 @@ Features:
 
 import os
 import gzip
-import random
 import pickle
 import numpy as np
 import torch
@@ -20,6 +19,7 @@ from typing import Optional, List, Dict, Set, Tuple
 from pathlib import Path
 
 from utils import register as R
+from data.bioparse.hierarchy import merge_cplx
 from data.bioparse.parser.cif_to_complex import (
     cif_to_complex,
     extract_ligand_from_cif,
@@ -34,6 +34,7 @@ from data.peptide import (
     terminal_descriptor,
     compute_term_rel_pos
 )
+from data.resample import ClusterResampler
 
 
 @R.register('DynamicCIFDataset')
@@ -57,6 +58,8 @@ class DynamicCIFDataset:
         self,
         cif_dir: str,
         cif_list: Optional[str] = None,
+        cluster: Optional[str] = None,
+        cluster_replace: bool = True,
         pocket_th_min: float = 10.0,
         pocket_th_max: float = 20.0,
         use_precomputed_distances: bool = False,
@@ -68,6 +71,10 @@ class DynamicCIFDataset:
             cif_dir: Directory containing .cif.gz files
             cif_list: Path to file listing .cif.gz filenames (one per line).
                      If None, automatically discovers all .cif.gz files.
+            cluster: Optional cluster file for weighted resampling between epochs.
+                     Can match either the pre-filter CIF list or the final filtered list.
+            cluster_replace: Whether cluster resampling should sample with replacement.
+                            Default True for true weighted oversampling by cluster size.
             pocket_th_min: Minimum distance threshold in Angstroms (default: 10.0)
             pocket_th_max: Maximum distance threshold in Angstroms (default: 20.0)
                           At each __getitem__, randomly sample threshold from [pocket_th_min, pocket_th_max]
@@ -83,6 +90,8 @@ class DynamicCIFDataset:
         self.use_precomputed_distances = use_precomputed_distances
         self.seed = seed
         self.num_workers = num_workers
+        self.cluster = cluster
+        self.cluster_replace = cluster_replace
         
         # Discover CIF files
         if cif_list:
@@ -135,23 +144,57 @@ class DynamicCIFDataset:
         print(f"Precomputed distances available for {len(self.precomputed_distances)} files")
         
         # Filter to only CIF files with ligands
-        self.cif_files = [f for f in self.cif_files if f in self.cif_ligand_ids]
+        original_cif_files = list(self.cif_files)
+        keep_indices = [i for i, f in enumerate(original_cif_files) if f in self.cif_ligand_ids]
+        self.cif_files = [original_cif_files[i] for i in keep_indices]
         
         if not self.cif_files:
             raise ValueError("No CIF files with ligand information found")
         
         print(f"Using {len(self.cif_files)} CIF files with ligand data")
+
+        # Optional cluster-based epoch resampling, similar to the mmap datasets.
+        self.resampler = None
+        self.dynamic_idxs = list(range(len(self.cif_files)))
+        if cluster is not None:
+            resampler = ClusterResampler(cluster)
+            if len(resampler.idx2prob) == len(original_cif_files):
+                idx2prob = resampler.idx2prob[keep_indices]
+            elif len(resampler.idx2prob) == len(self.cif_files):
+                idx2prob = resampler.idx2prob
+            else:
+                raise ValueError(
+                    f"Cluster file length {len(resampler.idx2prob)} does not match either "
+                    f"the discovered CIF count ({len(original_cif_files)}) or the filtered CIF count ({len(self.cif_files)})."
+                )
+            idx2prob = idx2prob / idx2prob.sum()
+            resampler.idx2prob = idx2prob
+            self.resampler = resampler
+            print(
+                f"Using cluster resampling from {os.path.basename(cluster)} "
+                f"(replace={cluster_replace})"
+            )
+            self.update_epoch()
     
     def __len__(self) -> int:
         """Total number of CIF files. Each file can be sampled multiple times with different ligands."""
-        return len(self.cif_files)
+        return len(self.dynamic_idxs)
+
+    def update_epoch(self):
+        if self.resampler is not None:
+            self.dynamic_idxs = self.resampler(
+                len(self.cif_files),
+                replace=self.cluster_replace
+            ).tolist()
+        else:
+            self.dynamic_idxs = list(range(len(self.cif_files)))
     
     def _load_cif_complex(self, cif_idx: int, ligand_id: int) -> tuple:
         """
         Load receptor and ligand from CIF file, filtering receptor by ligand_ids.
         
         Returns:
-            (receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks)
+            (merged_cplx, receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks)
         """
         cif_path = self.cif_files[cif_idx]
         
@@ -170,8 +213,9 @@ class DynamicCIFDataset:
         
         receptor_blocks = receptor_cplx[receptor_chain].blocks if receptor_chain else []
         ligand_blocks = ligand_cplx[ligand_chain].blocks if ligand_chain else []
+        merged_cplx = merge_cplx(receptor_cplx, ligand_cplx)
         
-        return receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks
+        return merged_cplx, receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks
     
     def _get_pocket_blocks_from_precomputed(
         self,
@@ -200,7 +244,7 @@ class DynamicCIFDataset:
         if ligand_id not in distances_data:
             return None
         
-        ligand_distances = distances_data[ligand_id]  # dict: residue_idx → min_distance
+        ligand_distances = distances_data[ligand_id]
         
         # Get all receptor residues and filter by distance
         receptor_chain = list(receptor_cplx.id2idx.keys())[0]
@@ -208,7 +252,9 @@ class DynamicCIFDataset:
         
         pocket_indices = []
         for block_idx, block in enumerate(receptor_blocks):
-            if block_idx in ligand_distances and ligand_distances[block_idx] <= pocket_th:
+            if block.id in ligand_distances and ligand_distances[block.id] <= pocket_th:
+                pocket_indices.append((receptor_chain, block.id))
+            elif block_idx in ligand_distances and ligand_distances[block_idx] <= pocket_th:
                 pocket_indices.append((receptor_chain, block.id))
         
         return pocket_indices
@@ -223,22 +269,22 @@ class DynamicCIFDataset:
         Returns:
             Data dictionary with features for training/inference
         """
-        # Set seed for reproducibility within this sample
-        random.seed(self.seed + idx)
-        np.random.seed(self.seed + idx)
-        torch.manual_seed(self.seed + idx)
-        
+        idx = self.dynamic_idxs[idx]
         cif_path = self.cif_files[idx]
         available_ligands = self.cif_ligand_ids[cif_path]
         
-        # Randomly select a ligand
-        ligand_id = random.choice(available_ligands)
+        # Sample ligand/threshold from the worker-local torch RNG so training
+        # remains reproducible without freezing one ligand choice per file.
+        ligand_idx = torch.randint(len(available_ligands), (1,)).item()
+        ligand_id = available_ligands[ligand_idx]
         
         # Randomly sample pocket threshold from [pocket_th_min, pocket_th_max]
-        pocket_th = random.uniform(self.pocket_th_min, self.pocket_th_max)
+        pocket_th = self.pocket_th_min + (
+            (self.pocket_th_max - self.pocket_th_min) * torch.rand(1).item()
+        )
         
         try:
-            receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks = \
+            merged_cplx, receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks = \
                 self._load_cif_complex(idx, ligand_id)
         except Exception as e:
             print(f"Error loading CIF {os.path.basename(cif_path)}, ligand {ligand_id}: {e}")
@@ -271,7 +317,7 @@ class DynamicCIFDataset:
         # Fall back to on-the-fly computation if no precomputed distances
         if pocket_block_ids is None:
             pocket_block_ids, _ = compute_pocket(
-                receptor_cplx,
+                merged_cplx,
                 [receptor_chain],
                 [ligand_chain],
                 dist_th=pocket_th
@@ -282,7 +328,7 @@ class DynamicCIFDataset:
         if not pocket_block_ids:
             pocket_th = max(self.pocket_th_max, pocket_th + 5.0)  # Increase threshold
             pocket_block_ids, _ = compute_pocket(
-                receptor_cplx,
+                merged_cplx,
                 [receptor_chain],
                 [ligand_chain],
                 dist_th=pocket_th
@@ -295,7 +341,7 @@ class DynamicCIFDataset:
         
         # Transform to tensors
         try:
-            data = transform_data(receptor_cplx, all_select_indexes)
+            data = transform_data(merged_cplx, all_select_indexes)
         except Exception as e:
             print(f"Error transforming data: {e}")
             return {
@@ -338,6 +384,12 @@ class DynamicCIFDataset:
             np.array(term_pos_list, dtype=np.float32),
             dtype=torch.float
         )
+
+        # Keep generated ligand positions contiguous, matching the peptide dataset behavior.
+        gen_mask = data['generate_mask']
+        ligand_position_ids = data['position_ids'][gen_mask]
+        ligand_position_ids = ligand_position_ids - ligand_position_ids.min() + 1
+        data['position_ids'][gen_mask] = ligand_position_ids
         
         # Add metadata for CFG training and logging
         data['pocket_th'] = pocket_th
@@ -359,9 +411,9 @@ class DynamicCIFDataset:
         for key in batch[0].keys():
             values = [item[key] for item in batch]
             
-            # Skip metadata fields (keep as lists for logging)
+            # Drop metadata fields from the model input batch.
             if key in ['pocket_th', 'cfg_eligible']:
-                results[key] = values
+                continue
             elif key == 'lengths':
                 results[key] = torch.tensor(values, dtype=torch.long)
             elif key == 'bonds':
@@ -391,7 +443,7 @@ if __name__ == '__main__':
     cif_dir = sys.argv[1]
     
     # Test dataset
-    dataset = DynamicCIFDataset(cif_dir, pocket_th=10.0)
+    dataset = DynamicCIFDataset(cif_dir, pocket_th_min=10.0, pocket_th_max=10.0)
     print(f"Dataset size: {len(dataset)}")
     
     # Try loading first sample

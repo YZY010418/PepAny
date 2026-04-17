@@ -12,6 +12,66 @@ from collections import defaultdict
 from ..hierarchy import Complex, Molecule, Block, Atom, Bond
 
 
+def _normalize_ins_code(ins_code: Optional[str]) -> str:
+    if ins_code in (None, '.', '?'):
+        return ''
+    return str(ins_code).strip()
+
+
+def _parse_ligand_ids(ligand_ids_str: Optional[str]) -> Set[int]:
+    if ligand_ids_str in (None, '.', '?'):
+        return set()
+    ligand_ids = set()
+    for token in str(ligand_ids_str).split(','):
+        token = token.strip()
+        if not token:
+            continue
+        ligand_ids.add(int(token))
+    return ligand_ids
+
+
+def _get_residue_ligand_map(
+    block_data: Dict[str, List[str]],
+) -> Dict[Tuple[str, int, str], Set[int]]:
+    """
+    Build a residue-level ligand mapping from the CPSEA receptor-ligand loop.
+    """
+    chain_ids = block_data.get('_cpsea_receptor_ligand_map.auth_asym_id', [])
+    seq_ids = block_data.get('_cpsea_receptor_ligand_map.auth_seq_id', [])
+    ins_codes = block_data.get('_cpsea_receptor_ligand_map.pdbx_PDB_ins_code', [])
+    label_chain_ids = block_data.get('_cpsea_receptor_ligand_map.label_asym_id', [])
+    label_seq_ids = block_data.get('_cpsea_receptor_ligand_map.label_seq_id', [])
+    ligand_ids = block_data.get('_cpsea_receptor_ligand_map.ligand_ids', [])
+
+    if not (chain_ids and seq_ids and ligand_ids):
+        return {}
+
+    if not ins_codes:
+        ins_codes = [''] * len(chain_ids)
+    if not label_chain_ids:
+        label_chain_ids = [''] * len(chain_ids)
+    if not label_seq_ids:
+        label_seq_ids = [''] * len(chain_ids)
+
+    residue_ligand_map: Dict[Tuple[str, int, str], Set[int]] = {}
+    for chain_id, seq_id, ins_code, label_chain_id, label_seq_id, ligand_ids_str in zip(
+        chain_ids, seq_ids, ins_codes, label_chain_ids, label_seq_ids, ligand_ids
+    ):
+        try:
+            ligand_id_set = _parse_ligand_ids(ligand_ids_str)
+            residue_ligand_map[(chain_id, int(seq_id), _normalize_ins_code(ins_code))] = ligand_id_set
+            if label_chain_id not in ('', '.', '?') and label_seq_id not in ('', '.', '?'):
+                residue_ligand_map[(
+                    label_chain_id,
+                    int(label_seq_id),
+                    _normalize_ins_code(ins_code)
+                )] = ligand_id_set
+        except (TypeError, ValueError):
+            continue
+
+    return residue_ligand_map
+
+
 def parse_cif_file(filepath: str) -> Dict[str, Dict[str, List[str]]]:
     """
     Parse mmCIF file and return dict of data blocks.
@@ -134,27 +194,47 @@ def cif_to_complex(
     auth_atom_ids = block_data.get('_atom_site.auth_atom_id', atom_ids)
     auth_comp_ids = block_data.get('_atom_site.auth_comp_id', [])
     auth_asym_ids = block_data.get('_atom_site.auth_asym_id', [])  # chain ID
+    atom_site_ids = block_data.get('_atom_site.id', [])
     auth_seq_ids = block_data.get('_atom_site.auth_seq_id', [])
+    pdbx_ins_codes = block_data.get('_atom_site.pdbx_PDB_ins_code', [''] * len(atom_ids))
     cartn_x = block_data.get('_atom_site.Cartn_x', [])
     cartn_y = block_data.get('_atom_site.Cartn_y', [])
     cartn_z = block_data.get('_atom_site.Cartn_z', [])
     type_symbols = block_data.get('_atom_site.type_symbol', [])
     ligand_ids_str = block_data.get('_atom_site.ligand_ids', [])  # comma-separated string
+    residue_ligand_map = _get_residue_ligand_map(block_data)
     
-    # Filter by ligand_ids if specified
+    # Filter by ligand_ids if specified. Prefer the residue-level CPSEA mapping,
+    # and fall back to the older per-atom annotation when present.
     atoms_to_include = []
-    for i, ligand_ids_str_val in enumerate(ligand_ids_str):
+    for i in range(len(atom_ids)):
         if ligand_ids_filter is None:
             atoms_to_include.append(i)
-        else:
-            # Parse comma-separated ligand IDs
-            try:
-                ligand_ids_set = set(int(x.strip()) for x in ligand_ids_str_val.split(','))
-                if ligand_ids_set & ligand_ids_filter:  # intersection
-                    atoms_to_include.append(i)
-            except (ValueError, AttributeError):
-                # If parsing fails, include atom
+            continue
+
+        try:
+            residue_key = (
+                auth_asym_ids[i],
+                int(auth_seq_ids[i]),
+                _normalize_ins_code(pdbx_ins_codes[i]),
+            )
+        except (IndexError, TypeError, ValueError):
+            residue_key = None
+
+        if residue_key is not None and residue_ligand_map:
+            if residue_ligand_map.get(residue_key, set()) & ligand_ids_filter:
                 atoms_to_include.append(i)
+            continue
+
+        if i < len(ligand_ids_str):
+            try:
+                if _parse_ligand_ids(ligand_ids_str[i]) & ligand_ids_filter:
+                    atoms_to_include.append(i)
+            except (TypeError, ValueError):
+                atoms_to_include.append(i)
+        else:
+            # Keep atoms if no ligand annotation is available for filtering.
+            atoms_to_include.append(i)
     
     # Build molecule dictionary
     molecules_dict = defaultdict(lambda: defaultdict(list))
@@ -166,10 +246,15 @@ def cif_to_complex(
         if selected_chains and chain_id not in selected_chains:
             continue
         
-        residue_num = int(auth_seq_ids[idx])
+        try:
+            residue_num = int(auth_seq_ids[idx])
+        except (TypeError, ValueError, IndexError):
+            continue
+        insertion_code = _normalize_ins_code(pdbx_ins_codes[idx] if idx < len(pdbx_ins_codes) else '')
         residue_name = auth_comp_ids[idx]
         atom_name = auth_atom_ids[idx]
         element = type_symbols[idx].strip()
+        atom_id = atom_site_ids[idx] if idx < len(atom_site_ids) else str(idx + 1)
         
         # Parse coordinates
         try:
@@ -181,25 +266,26 @@ def cif_to_complex(
         atom = Atom(
             name=atom_name,
             element=element,
-            coord=[x, y, z],
+            coordinate=[x, y, z],
+            id=str(atom_id),
             properties={}
         )
         
-        molecules_dict[chain_id][residue_num].append((residue_name, atom))
+        molecules_dict[chain_id][(residue_num, insertion_code)].append((residue_name, atom))
     
     # Build Molecule and Block objects
     molecules = []
     for chain_id in sorted(molecules_dict.keys()):
         blocks = []
-        for residue_num in sorted(molecules_dict[chain_id].keys()):
-            residue_atoms = molecules_dict[chain_id][residue_num]
+        for residue_id in sorted(molecules_dict[chain_id].keys()):
+            residue_atoms = molecules_dict[chain_id][residue_id]
             if residue_atoms:
                 residue_name = residue_atoms[0][0]
                 atoms_list = [atom for _, atom in residue_atoms]
                 
                 block = Block(
                     name=residue_name,
-                    id=(residue_num, ''),  # (sequence number, insertion code)
+                    id=residue_id,
                     atoms=atoms_list,
                     properties={}
                 )
@@ -207,6 +293,7 @@ def cif_to_complex(
         
         if blocks:
             molecule = Molecule(
+                name=chain_id,
                 id=chain_id,
                 blocks=blocks,
                 properties={}
@@ -291,16 +378,21 @@ def get_ligand_ids_from_receptor(
         receptor_block_name = list(data_blocks.keys())[0]
     
     block_data = data_blocks[receptor_block_name]
-    ligand_ids_str_list = block_data.get('_atom_site.ligand_ids', [])
-    
+    residue_ligand_map = _get_residue_ligand_map(block_data)
+
     ligand_ids = set()
+    if residue_ligand_map:
+        for ids in residue_ligand_map.values():
+            ligand_ids.update(ids)
+        return ligand_ids
+
+    ligand_ids_str_list = block_data.get('_atom_site.ligand_ids', [])
     for ligand_ids_str in ligand_ids_str_list:
         try:
-            ids = set(int(x.strip()) for x in ligand_ids_str.split(','))
-            ligand_ids.update(ids)
-        except (ValueError, AttributeError):
-            pass
-    
+            ligand_ids.update(_parse_ligand_ids(ligand_ids_str))
+        except (ValueError, TypeError):
+            continue
+
     return ligand_ids
 
 
