@@ -21,9 +21,15 @@ import os
 import sys
 import pickle
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from itertools import repeat
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def compute_distances_for_cif(cif_path, output_dir):
     """
@@ -38,7 +44,9 @@ def compute_distances_for_cif(cif_path, output_dir):
     """
     try:
         # Import here to avoid issues if module not fully loaded
-        sys.path.insert(0, '/Users/bytedance/Desktop/PepAny')
+        repo_root = str(REPO_ROOT)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
         from data.bioparse.parser.cif_to_complex import (
             cif_to_complex,
             extract_ligand_from_cif,
@@ -124,6 +132,18 @@ def main():
                        help='Output directory for .distances.pkl files (default: same as cif_dir)')
     parser.add_argument('--pattern', default='*.cif.gz',
                        help='File pattern to match (default: *.cif.gz)')
+    parser.add_argument(
+        '-j', '--num-workers',
+        type=int,
+        default=max(1, os.cpu_count() or 1),
+        help='Number of CPU worker processes to use (default: all available CPUs)'
+    )
+    parser.add_argument(
+        '--chunksize',
+        type=int,
+        default=1,
+        help='Task chunksize for multiprocessing (default: 1)'
+    )
     
     args = parser.parse_args()
     
@@ -143,18 +163,39 @@ def main():
     
     print(f"Found {len(cif_files)} CIF files to process")
     print(f"Output directory: {output_dir}")
+    print(f"CPU workers: {args.num_workers}")
     print()
     
     # Process each file
     successful = 0
     failed = 0
-    
-    for cif_path in tqdm(cif_files, desc="Computing distances"):
-        out_path = compute_distances_for_cif(str(cif_path), output_dir)
-        if out_path:
-            successful += 1
-        else:
-            failed += 1
+
+    cif_paths = [str(path) for path in cif_files]
+    num_workers = max(1, min(args.num_workers, len(cif_paths)))
+
+    if num_workers == 1:
+        result_iter = (
+            compute_distances_for_cif(cif_path, output_dir)
+            for cif_path in cif_paths
+        )
+    else:
+        executor = ProcessPoolExecutor(max_workers=num_workers)
+        result_iter = executor.map(
+            compute_distances_for_cif,
+            cif_paths,
+            repeat(output_dir),
+            chunksize=max(1, args.chunksize)
+        )
+
+    try:
+        for out_path in tqdm(result_iter, total=len(cif_paths), desc="Computing distances"):
+            if out_path:
+                successful += 1
+            else:
+                failed += 1
+    finally:
+        if num_workers > 1:
+            executor.shutdown(wait=True)
     
     print()
     print(f"✓ Completed: {successful} successful, {failed} failed")
