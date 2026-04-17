@@ -136,7 +136,7 @@ class CondIterAutoEncoder(nn.Module):
             kl_on_pocket=False,         # whether to exert kl regularization also on pocket nodes
             discrete_timestep=False,
             default_num_steps=10,
-            cfg_dropout_ratio=0.4,       
+            cfg_dropout_ratio=0.2,       
             guidance_scale=1.5,
         ) -> None:
         super().__init__()

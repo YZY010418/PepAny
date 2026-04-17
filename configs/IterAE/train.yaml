@@ -104,7 +104,7 @@ trainer:
 
 model:
   class: CondIterAutoEncoder
-  cfg_dropout_ratio: 0.4
+  cfg_dropout_ratio: 0.2
   guidance_scale: 1.5 
   encoder_type: EPT
   decoder_type: EPT

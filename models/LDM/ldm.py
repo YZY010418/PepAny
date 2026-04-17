@@ -28,7 +28,7 @@ class LDMMolDesign(nn.Module):
             h_loss_weight=None,
             std=10.0,
             is_aa_corrupt_ratio=0.1,
-            cfg_dropout_ratio=0.4,
+            cfg_dropout_ratio=0.2,
             guidance_scale=1.5,
             diffusion_opt={}
         ):
