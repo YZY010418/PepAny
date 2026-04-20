@@ -15,7 +15,7 @@ import gzip
 import pickle
 import numpy as np
 import torch
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from typing import Optional, List, Dict, Set, Tuple
 from pathlib import Path
 
@@ -66,6 +66,7 @@ class DynamicCIFDataset:
         use_precomputed_distances: bool = False,
         precomputed_distances_dir: Optional[str] = None,
         ligand_ids_tsv: Optional[str] = None,
+        max_cached_distance_files: int = 128,
         seed: int = 42,
         num_workers: int = 0,
     ):
@@ -91,6 +92,9 @@ class DynamicCIFDataset:
                             or 8DTM_cluster0.cif.gz) and the second column the
                             ligand ID integer. When provided, startup skips the
                             expensive per-CIF ligand scan and trusts this metadata.
+            max_cached_distance_files: Maximum number of precomputed distance
+                            pickle files kept in memory per dataset instance.
+                            Only used when use_precomputed_distances=True.
             seed: Random seed for reproducibility
             num_workers: For potential parallel loading (future use)
         """
@@ -107,6 +111,7 @@ class DynamicCIFDataset:
         self.cluster = cluster
         self.cluster_replace = cluster_replace
         self.ligand_ids_tsv = ligand_ids_tsv
+        self.max_cached_distance_files = max(1, int(max_cached_distance_files))
         
         def _resolve_cif_path(entry: str) -> str:
             entry = entry.strip()
@@ -187,8 +192,8 @@ class DynamicCIFDataset:
         
         # Pre-compute ligand IDs for each CIF file
         self.cif_ligand_ids = {}
-        # Load precomputed distances if available
-        self.precomputed_distances = {}
+        # Precomputed distances are loaded lazily on demand to keep memory bounded.
+        self.precomputed_distances = OrderedDict()
 
         if ligand_ids_tsv is not None:
             print(f"Loading ligand metadata from TSV: {ligand_ids_tsv}")
@@ -216,20 +221,24 @@ class DynamicCIFDataset:
         print(f"Using {len(self.cif_files)} CIF files with ligand data")
 
         if use_precomputed_distances:
-            print("Loading precomputed distance files...")
+            print(
+                "Precomputed distances will be loaded lazily on demand "
+                f"(cache size: {self.max_cached_distance_files} files)"
+            )
             missing_distance_examples = []
+            matched_distance_examples = []
             for cif_path in self.cif_files:
                 dist_path = self._get_distance_path(cif_path)
                 if dist_path is not None and os.path.exists(dist_path):
-                    try:
-                        with open(dist_path, 'rb') as f:
-                            self.precomputed_distances[cif_path] = pickle.load(f)
-                    except Exception as e:
-                        print(f"  Warning: Could not load distances from {os.path.basename(dist_path)}: {e}")
+                    if len(matched_distance_examples) < 5:
+                        matched_distance_examples.append(os.path.basename(dist_path))
                 elif len(missing_distance_examples) < 5:
                     missing_distance_examples.append(os.path.basename(dist_path))
-            print(f"Precomputed distances available for {len(self.precomputed_distances)} files")
-            if len(self.precomputed_distances) == 0 and missing_distance_examples:
+            if matched_distance_examples:
+                print("  Example matched distance files:")
+                for name in matched_distance_examples:
+                    print(f"    - {name}")
+            if not matched_distance_examples and missing_distance_examples:
                 print("  Warning: No precomputed distance files matched. Expected names like:")
                 for name in missing_distance_examples:
                     print(f"    - {name}")
@@ -315,6 +324,27 @@ class DynamicCIFDataset:
             ).tolist()
         else:
             self.dynamic_idxs = list(range(len(self.cif_files)))
+
+    def _get_precomputed_distances_for_cif(self, cif_path: str):
+        if not self.use_precomputed_distances:
+            return None
+        if cif_path in self.precomputed_distances:
+            self.precomputed_distances.move_to_end(cif_path)
+            return self.precomputed_distances[cif_path]
+        dist_path = self._get_distance_path(cif_path)
+        if dist_path is None or not os.path.exists(dist_path):
+            return None
+        try:
+            with open(dist_path, 'rb') as f:
+                distances_data = pickle.load(f)
+        except Exception as e:
+            print(f"  Warning: Could not load distances from {os.path.basename(dist_path)}: {e}")
+            return None
+        self.precomputed_distances[cif_path] = distances_data
+        self.precomputed_distances.move_to_end(cif_path)
+        while len(self.precomputed_distances) > self.max_cached_distance_files:
+            self.precomputed_distances.popitem(last=False)
+        return distances_data
     
     def _load_cif_complex(self, cif_idx: int, ligand_id: int) -> tuple:
         """
@@ -363,11 +393,10 @@ class DynamicCIFDataset:
         Returns:
             List of block indices (chain, block_id) that are within pocket_th
         """
-        if cif_path not in self.precomputed_distances:
+        distances_data = self._get_precomputed_distances_for_cif(cif_path)
+        if distances_data is None:
             return None
-        
-        distances_data = self.precomputed_distances[cif_path]
-        
+
         if ligand_id not in distances_data:
             return None
         
