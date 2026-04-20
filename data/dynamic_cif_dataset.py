@@ -117,14 +117,9 @@ class DynamicCIFDataset:
             entry = entry.strip()
             if not entry:
                 return entry
-            candidate = os.path.join(cif_dir, entry)
-            if os.path.exists(candidate):
-                return candidate
-            for suffix in ('.cif.gz', '.cif'):
-                candidate_with_suffix = candidate + suffix
-                if os.path.exists(candidate_with_suffix):
-                    return candidate_with_suffix
-            return candidate + '.cif.gz'
+            if entry.endswith('.cif.gz') or entry.endswith('.cif'):
+                return os.path.join(cif_dir, entry)
+            return os.path.join(cif_dir, entry + '.cif.gz')
 
         def _normalize_cif_id(value: str) -> str:
             base_name = os.path.basename(value.strip())
