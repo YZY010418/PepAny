@@ -577,7 +577,10 @@ class DynamicCIFDataset:
                 offset = 0
                 for i, bonds in enumerate(values):
                     bonds = bonds.clone()
-                    bonds[:, :2] = bonds[:, :2] + offset
+                    if bonds.numel() == 0:
+                        bonds = bonds.reshape(0, 3)
+                    else:
+                        bonds[:, :2] = bonds[:, :2] + offset
                     if i == 0:
                         results[key] = bonds
                     else:

@@ -125,7 +125,10 @@ def transform_data(cplx: Complex, select_block_indexes: List[tuple]):
             atom_id2data_id[bond.index2], # end
             bond.bond_type.value          # bond type
         ))
-    data['bonds'] = torch.tensor(bonds, dtype=torch.long) # [E, 3]
+    if len(bonds) == 0:
+        data['bonds'] = torch.empty((0, 3), dtype=torch.long)
+    else:
+        data['bonds'] = torch.tensor(bonds, dtype=torch.long) # [E, 3]
     return data
 
 
