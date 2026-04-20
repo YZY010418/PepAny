@@ -112,6 +112,8 @@ def transform_data(cplx: Complex, select_block_indexes: List[tuple]):
     for chain in chain2block_ids:
         for block, prefix_id in zip(chain2blocks[chain], chain2block_ids[chain]):
             for atom in block:
+                if atom.get_element() == 'H':
+                    continue
                 atom_id = prefix_id + (atom.id,) # custom index
                 atom_id2data_id[index_to_numerical_index(cplx, atom_id)] = len(atom_id2data_id)
 

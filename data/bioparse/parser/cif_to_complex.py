@@ -218,11 +218,15 @@ def _cif_to_complex_with_biotite(
         insert_code = _normalize_ins_code(str(atom.ins_code))
         res_id = (res_number, insert_code)
         atom_id = str(atom_id_annotation[i]) if atom_id_annotation is not None else str(i + 1)
+        element = str(atom.element)
+
+        if element == 'H':
+            continue
 
         atom_instance = Atom(
             name=str(atom.atom_name).strip(),
             coordinate=atom.coord.tolist(),
-            element=str(atom.element),
+            element=element,
             id=atom_id,
             properties={}
         )
@@ -468,6 +472,9 @@ def cif_to_complex(
         atom_name = auth_atom_ids[idx]
         element = type_symbols[idx].strip()
         atom_id = atom_site_ids[idx] if idx < len(atom_site_ids) else str(idx + 1)
+
+        if element == 'H':
+            continue
         
         # Parse coordinates
         try:
