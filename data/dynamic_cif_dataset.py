@@ -100,11 +100,24 @@ class DynamicCIFDataset:
         self.cluster = cluster
         self.cluster_replace = cluster_replace
         
+        def _resolve_cif_path(entry: str) -> str:
+            entry = entry.strip()
+            if not entry:
+                return entry
+            candidate = os.path.join(cif_dir, entry)
+            if os.path.exists(candidate):
+                return candidate
+            for suffix in ('.cif.gz', '.cif'):
+                candidate_with_suffix = candidate + suffix
+                if os.path.exists(candidate_with_suffix):
+                    return candidate_with_suffix
+            return candidate + '.cif.gz'
+
         # Discover CIF files
         if cif_list:
             with open(cif_list, 'r') as f:
                 self.cif_files = [
-                    os.path.join(cif_dir, line.strip())
+                    _resolve_cif_path(line)
                     for line in f if line.strip()
                 ]
         else:
