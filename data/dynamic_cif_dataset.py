@@ -121,6 +121,13 @@ class DynamicCIFDataset:
                     return candidate_with_suffix
             return candidate + '.cif.gz'
 
+        def _normalize_cif_id(value: str) -> str:
+            base_name = os.path.basename(value.strip())
+            for suffix in ('.cif.gz', '.cif'):
+                if base_name.endswith(suffix):
+                    return base_name[:-len(suffix)]
+            return base_name
+
         # Discover CIF files
         if cif_list:
             with open(cif_list, 'r') as f:
@@ -210,6 +217,7 @@ class DynamicCIFDataset:
 
         if use_precomputed_distances:
             print("Loading precomputed distance files...")
+            missing_distance_examples = []
             for cif_path in self.cif_files:
                 dist_path = self._get_distance_path(cif_path)
                 if dist_path is not None and os.path.exists(dist_path):
@@ -218,21 +226,44 @@ class DynamicCIFDataset:
                             self.precomputed_distances[cif_path] = pickle.load(f)
                     except Exception as e:
                         print(f"  Warning: Could not load distances from {os.path.basename(dist_path)}: {e}")
+                elif len(missing_distance_examples) < 5:
+                    missing_distance_examples.append(os.path.basename(dist_path))
             print(f"Precomputed distances available for {len(self.precomputed_distances)} files")
+            if len(self.precomputed_distances) == 0 and missing_distance_examples:
+                print("  Warning: No precomputed distance files matched. Expected names like:")
+                for name in missing_distance_examples:
+                    print(f"    - {name}")
 
         # Optional cluster-based epoch resampling, similar to the mmap datasets.
         self.resampler = None
         self.dynamic_idxs = list(range(len(self.cif_files)))
         if cluster is not None:
             resampler = ClusterResampler(cluster)
-            if len(resampler.idx2prob) == len(original_cif_files):
+            cluster_id2prob = {
+                _normalize_cif_id(_id): prob
+                for _id, prob in zip(resampler.ids, resampler.idx2prob)
+            }
+            matched_probs = [
+                cluster_id2prob[_normalize_cif_id(cif_path)]
+                for cif_path in self.cif_files
+                if _normalize_cif_id(cif_path) in cluster_id2prob
+            ]
+            if len(matched_probs) == len(self.cif_files):
+                idx2prob = np.array(matched_probs, dtype=float)
+            elif len(resampler.idx2prob) == len(original_cif_files):
                 idx2prob = resampler.idx2prob[keep_indices]
             elif len(resampler.idx2prob) == len(self.cif_files):
                 idx2prob = resampler.idx2prob
             else:
+                missing_cluster = [
+                    _normalize_cif_id(cif_path)
+                    for cif_path in self.cif_files
+                    if _normalize_cif_id(cif_path) not in cluster_id2prob
+                ][:5]
                 raise ValueError(
-                    f"Cluster file length {len(resampler.idx2prob)} does not match either "
-                    f"the discovered CIF count ({len(original_cif_files)}) or the filtered CIF count ({len(self.cif_files)})."
+                    f"Could not align cluster file {os.path.basename(cluster)} to the CIF list. "
+                    f"Matched {len(matched_probs)}/{len(self.cif_files)} CIF IDs by name. "
+                    f"Examples missing from cluster file: {missing_cluster}"
                 )
             idx2prob = idx2prob / idx2prob.sum()
             resampler.idx2prob = idx2prob
@@ -255,10 +286,22 @@ class DynamicCIFDataset:
     def _get_distance_path(self, cif_path: str) -> Optional[str]:
         if self.precomputed_distances_dir is None:
             return None
-        return os.path.join(
-            self.precomputed_distances_dir,
-            self._get_distance_filename(cif_path)
-        )
+        base_name = os.path.basename(cif_path)
+        candidates = [self._get_distance_filename(cif_path)]
+        candidates.append(base_name + '.distances.pkl')
+        normalized_name = base_name
+        for suffix in ('.cif.gz', '.cif'):
+            if normalized_name.endswith(suffix):
+                normalized_name = normalized_name[:-len(suffix)]
+                break
+        normalized_name = normalized_name + '.distances.pkl'
+        if normalized_name not in candidates:
+            candidates.append(normalized_name)
+        for candidate in candidates:
+            dist_path = os.path.join(self.precomputed_distances_dir, candidate)
+            if os.path.exists(dist_path):
+                return dist_path
+        return os.path.join(self.precomputed_distances_dir, candidates[0])
     
     def __len__(self) -> int:
         """Total number of CIF files. Each file can be sampled multiple times with different ligands."""

@@ -10,13 +10,19 @@ import torch
 class ClusterResampler:
     def __init__(self, cluster_path: str) -> None:
         idx2prob = []
+        ids = []
         with open(cluster_path, 'r') as fin:
             for line in fin:
-                cluster_n_member = int(line.strip().split('\t')[-1])
+                fields = line.strip().split('\t')
+                if len(fields) < 1 or not fields[0]:
+                    continue
+                cluster_n_member = int(fields[-1])
                 idx2prob.append(1 / cluster_n_member)
+                ids.append(fields[0])
         total = sum(idx2prob)
         idx2prob = [p / total for p in idx2prob]
         self.idx2prob = np.array(idx2prob)
+        self.ids = ids
 
     def __call__(self, n_sample:int, replace: bool=False):
         idxs = np.random.choice(len(self.idx2prob), size=n_sample, replace=replace, p=self.idx2prob)
