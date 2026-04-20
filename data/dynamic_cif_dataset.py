@@ -15,6 +15,7 @@ import gzip
 import pickle
 import numpy as np
 import torch
+from collections import defaultdict
 from typing import Optional, List, Dict, Set, Tuple
 from pathlib import Path
 
@@ -64,6 +65,7 @@ class DynamicCIFDataset:
         pocket_th_max: float = 20.0,
         use_precomputed_distances: bool = False,
         precomputed_distances_dir: Optional[str] = None,
+        ligand_ids_tsv: Optional[str] = None,
         seed: int = 42,
         num_workers: int = 0,
     ):
@@ -84,6 +86,11 @@ class DynamicCIFDataset:
                                       Files should be named: 8DTM_cluster0.distances.pkl
             precomputed_distances_dir: Directory containing precomputed distance pickle files.
                                        If None, no separate distance directory is used.
+            ligand_ids_tsv: Optional TSV manifest for available ligands. The first
+                            column should be the CIF basename (e.g. 8DTM_cluster0
+                            or 8DTM_cluster0.cif.gz) and the second column the
+                            ligand ID integer. When provided, startup skips the
+                            expensive per-CIF ligand scan and trusts this metadata.
             seed: Random seed for reproducibility
             num_workers: For potential parallel loading (future use)
         """
@@ -99,6 +106,7 @@ class DynamicCIFDataset:
         self.num_workers = num_workers
         self.cluster = cluster
         self.cluster_replace = cluster_replace
+        self.ligand_ids_tsv = ligand_ids_tsv
         
         def _resolve_cif_path(entry: str) -> str:
             entry = entry.strip()
@@ -127,6 +135,37 @@ class DynamicCIFDataset:
                 for f in os.listdir(cif_dir)
                 if f.endswith('.cif.gz') or f.endswith('.cif')
             ])
+
+        def _load_ligand_ids_from_tsv(tsv_path: str) -> Dict[str, List[int]]:
+            ligand_map = defaultdict(set)
+            with open(tsv_path, 'r') as fin:
+                for line_no, line in enumerate(fin, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    fields = line.split('\t')
+                    if len(fields) < 2:
+                        raise ValueError(
+                            f'Expected at least 2 tab-separated columns in {tsv_path} '
+                            f'at line {line_no}, got: {line}'
+                        )
+                    try:
+                        ligand_id = int(fields[1])
+                    except ValueError:
+                        if line_no == 1:
+                            # Allow a header row like: cif_id\tligand_id
+                            continue
+                        raise ValueError(
+                            f'Ligand ID must be an integer in {tsv_path} at line {line_no}, '
+                            f'got: {fields[1]}'
+                        )
+                    cif_path = _resolve_cif_path(fields[0])
+                    ligand_map[cif_path].add(ligand_id)
+            return {
+                cif_path: sorted(ligand_ids)
+                for cif_path, ligand_ids in ligand_map.items()
+                if ligand_ids
+            }
         
         if not self.cif_files:
             raise ValueError(f"No .cif or .cif.gz files found in {cif_dir}")
@@ -143,29 +182,21 @@ class DynamicCIFDataset:
         self.cif_ligand_ids = {}
         # Load precomputed distances if available
         self.precomputed_distances = {}
-        
-        print("Scanning CIF files for available ligands...")
-        for cif_path in self.cif_files:
-            try:
-                ligand_ids = get_ligand_ids_from_receptor(cif_path)
-                if ligand_ids:
-                    self.cif_ligand_ids[cif_path] = sorted(ligand_ids)
-                    
-                    # Try to load precomputed distances
-                    if use_precomputed_distances:
-                        dist_path = self._get_distance_path(cif_path)
-                        if dist_path is not None and os.path.exists(dist_path):
-                            try:
-                                with open(dist_path, 'rb') as f:
-                                    self.precomputed_distances[cif_path] = pickle.load(f)
-                            except Exception as e:
-                                print(f"  Warning: Could not load distances from {os.path.basename(dist_path)}: {e}")
-                        
-            except Exception as e:
-                print(f"  Warning: Could not read ligands from {os.path.basename(cif_path)}: {e}")
-        
-        print(f"Successfully indexed {len(self.cif_ligand_ids)} CIF files")
-        print(f"Precomputed distances available for {len(self.precomputed_distances)} files")
+
+        if ligand_ids_tsv is not None:
+            print(f"Loading ligand metadata from TSV: {ligand_ids_tsv}")
+            self.cif_ligand_ids = _load_ligand_ids_from_tsv(ligand_ids_tsv)
+            print(f"Loaded ligand metadata for {len(self.cif_ligand_ids)} CIF files")
+        else:
+            print("Scanning CIF files for available ligands...")
+            for cif_path in self.cif_files:
+                try:
+                    ligand_ids = get_ligand_ids_from_receptor(cif_path)
+                    if ligand_ids:
+                        self.cif_ligand_ids[cif_path] = sorted(ligand_ids)
+                except Exception as e:
+                    print(f"  Warning: Could not read ligands from {os.path.basename(cif_path)}: {e}")
+            print(f"Successfully indexed {len(self.cif_ligand_ids)} CIF files")
         
         # Filter to only CIF files with ligands
         original_cif_files = list(self.cif_files)
@@ -176,6 +207,18 @@ class DynamicCIFDataset:
             raise ValueError("No CIF files with ligand information found")
         
         print(f"Using {len(self.cif_files)} CIF files with ligand data")
+
+        if use_precomputed_distances:
+            print("Loading precomputed distance files...")
+            for cif_path in self.cif_files:
+                dist_path = self._get_distance_path(cif_path)
+                if dist_path is not None and os.path.exists(dist_path):
+                    try:
+                        with open(dist_path, 'rb') as f:
+                            self.precomputed_distances[cif_path] = pickle.load(f)
+                    except Exception as e:
+                        print(f"  Warning: Could not load distances from {os.path.basename(dist_path)}: {e}")
+            print(f"Precomputed distances available for {len(self.precomputed_distances)} files")
 
         # Optional cluster-based epoch resampling, similar to the mmap datasets.
         self.resampler = None
