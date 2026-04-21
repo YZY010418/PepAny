@@ -426,8 +426,19 @@ class CondIterAutoEncoder(nn.Module):
         # decode atom-level structures
         edges, edge_type = self.get_edges(batch_ids, chain_ids, X, block_ids, None, True, True)
         edge_attr = self.edge_embedding(edge_type)
+        if term_rel_pos is None:
+            term_pos_embedding = Zh.new_zeros(
+                (block_ids.shape[0], self.dec_term_pos_proj.out_features)
+            )
+        else:
+            term_pos_embedding = self.dec_term_pos_proj(term_rel_pos[block_ids])
+
         H = self.dec_input_linear(torch.cat([
-            self.dec_atom_embedding(A), self.dec_time_embedding(t), self.dec_pos_embedding(position_ids[block_ids]), Zh[block_ids], self.dec_term_pos_proj(term_rel_pos[block_ids]) if term_rel_pos is not None else torch.zeros_like(Zh[block_ids])
+            self.dec_atom_embedding(A),
+            self.dec_time_embedding(t),
+            self.dec_pos_embedding(position_ids[block_ids]),
+            Zh[block_ids],
+            term_pos_embedding
         ], dim=-1)) # [Natom, hidden_size]
         H_t, X_next = self.decoder(H, X, block_ids, batch_ids, edges, edge_attr, topo_edges, topo_edge_attr) # [Natom', hidden_size], [Natom', 3]
         
