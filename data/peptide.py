@@ -57,7 +57,7 @@ def compute_term_rel_pos(block_n, block, block_c):
         if c_ac is not None:
             d_n, norm_n, center_n = terminal_descriptor(c_ac, c_n, o_n, n_n, ca_n)
         else:
-            d_n, norm_n, center_n = np.zeros(3), np.zeros(3), get_atom_coord(block, 'CA')
+            d_n, norm_n, center_n = np.zeros(3), np.zeros(3), get_atom_coord(block, 'CA') # make the process smooth
         
         if ca_cn is not None:
             d_c, norm_c, center_c = terminal_descriptor(ca_c, c_c, o_c, n_c, ca_cn)

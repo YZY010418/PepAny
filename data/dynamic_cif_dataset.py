@@ -54,6 +54,12 @@ class DynamicCIFDataset:
     4. Construct complex(receptor_filtered + ligand)
     5. Compute features including terminal positions
     """
+
+    MODEL_KEYS = (
+        'X', 'S', 'A', 'position_ids', 'chain_ids', 'is_aa',
+        'block_lengths', 'bonds', 'generate_mask', 'center_mask',
+        'term_rel_pos', 'lengths'
+    )
     
     def __init__(
         self,
@@ -67,6 +73,7 @@ class DynamicCIFDataset:
         precomputed_distances_dir: Optional[str] = None,
         ligand_ids_tsv: Optional[str] = None,
         max_cached_distance_files: int = 128,
+        max_sample_retries: int = 10,
         seed: int = 42,
         num_workers: int = 0,
     ):
@@ -95,6 +102,8 @@ class DynamicCIFDataset:
             max_cached_distance_files: Maximum number of precomputed distance
                             pickle files kept in memory per dataset instance.
                             Only used when use_precomputed_distances=True.
+            max_sample_retries: Maximum number of alternate CIF/ligand samples
+                            to try when one runtime-loaded sample is malformed.
             seed: Random seed for reproducibility
             num_workers: For potential parallel loading (future use)
         """
@@ -112,6 +121,7 @@ class DynamicCIFDataset:
         self.cluster_replace = cluster_replace
         self.ligand_ids_tsv = ligand_ids_tsv
         self.max_cached_distance_files = max(1, int(max_cached_distance_files))
+        self.max_sample_retries = max(1, int(max_sample_retries))
         
         def _resolve_cif_path(entry: str) -> str:
             entry = entry.strip()
@@ -409,8 +419,115 @@ class DynamicCIFDataset:
                 pocket_indices.append((receptor_chain, block.id))
         
         return pocket_indices
+
+    @staticmethod
+    def _empty_sample(error: str = "") -> Dict:
+        return {
+            'X': torch.empty((0, 3), dtype=torch.float),
+            'S': torch.empty(0, dtype=torch.long),
+            'A': torch.empty(0, dtype=torch.long),
+            'position_ids': torch.empty(0, dtype=torch.long),
+            'chain_ids': torch.empty(0, dtype=torch.long),
+            'is_aa': torch.empty(0, dtype=torch.bool),
+            'block_lengths': torch.empty(0, dtype=torch.long),
+            'bonds': torch.empty((0, 3), dtype=torch.long),
+            'generate_mask': torch.empty(0, dtype=torch.bool),
+            'center_mask': torch.empty(0, dtype=torch.bool),
+            'term_rel_pos': torch.empty((0, 15), dtype=torch.float),
+            'lengths': 0,
+            '_valid': False,
+            '_error': error,
+        }
+
+    @staticmethod
+    def _sample_validation_error(data: Dict) -> Optional[str]:
+        if not isinstance(data, dict):
+            return f"sample is not a dict: {type(data)}"
+        missing_keys = [key for key in DynamicCIFDataset.MODEL_KEYS if key not in data]
+        if missing_keys:
+            return f"missing required keys: {missing_keys}"
+
+        try:
+            n_blocks = int(data['lengths'])
+            n_atoms = int(data['A'].shape[0])
+            if n_blocks <= 0 or n_atoms <= 0:
+                return f"empty sample: lengths={n_blocks}, atoms={n_atoms}"
+            if not torch.is_floating_point(data['X']):
+                return f"X dtype is {data['X'].dtype}, expected floating point"
+            if data['X'].ndim != 2 or data['X'].shape != (n_atoms, 3):
+                return f"X shape {tuple(data['X'].shape)} does not match atoms={n_atoms}"
+            if not bool(torch.isfinite(data['X']).all().item()):
+                return "X contains NaN or Inf"
+            if data['S'].shape[0] != n_blocks:
+                return f"S shape {tuple(data['S'].shape)} does not match blocks={n_blocks}"
+            if data['S'].numel() != 0 and int(data['S'].min().item()) < 0:
+                return "S contains negative block type IDs"
+            if data['A'].numel() != 0 and int(data['A'].min().item()) < 0:
+                return "A contains negative atom type IDs"
+            if data['position_ids'].shape[0] != n_blocks:
+                return f"position_ids shape {tuple(data['position_ids'].shape)} does not match blocks={n_blocks}"
+            if data['chain_ids'].shape[0] != n_blocks:
+                return f"chain_ids shape {tuple(data['chain_ids'].shape)} does not match blocks={n_blocks}"
+            if data['is_aa'].shape[0] != n_blocks:
+                return f"is_aa shape {tuple(data['is_aa'].shape)} does not match blocks={n_blocks}"
+            if data['block_lengths'].shape[0] != n_blocks:
+                return f"block_lengths shape {tuple(data['block_lengths'].shape)} does not match blocks={n_blocks}"
+            if int(data['block_lengths'].sum().item()) != n_atoms:
+                return (
+                    f"sum(block_lengths)={int(data['block_lengths'].sum().item())} "
+                    f"does not match atoms={n_atoms}"
+                )
+            if data['generate_mask'].shape[0] != n_blocks:
+                return f"generate_mask shape {tuple(data['generate_mask'].shape)} does not match blocks={n_blocks}"
+            if data['generate_mask'].dtype != torch.bool:
+                return f"generate_mask dtype is {data['generate_mask'].dtype}, expected bool"
+            if data['center_mask'].shape[0] != n_blocks:
+                return f"center_mask shape {tuple(data['center_mask'].shape)} does not match blocks={n_blocks}"
+            if data['center_mask'].dtype != torch.bool:
+                return f"center_mask dtype is {data['center_mask'].dtype}, expected bool"
+            if not bool(data['generate_mask'].any().item()):
+                return "generate_mask has no generated blocks"
+            if not bool(data['center_mask'].any().item()):
+                return "center_mask has no context/centering blocks"
+            if data['term_rel_pos'].shape != (n_blocks, 15):
+                return f"term_rel_pos shape {tuple(data['term_rel_pos'].shape)} does not match ({n_blocks}, 15)"
+            if not torch.is_floating_point(data['term_rel_pos']):
+                return f"term_rel_pos dtype is {data['term_rel_pos'].dtype}, expected floating point"
+            if not bool(torch.isfinite(data['term_rel_pos']).all().item()):
+                return "term_rel_pos contains NaN or Inf"
+            if data['bonds'].ndim != 2 or data['bonds'].shape[1] != 3:
+                return f"bonds shape {tuple(data['bonds'].shape)} is not [Nbonds, 3]"
+            if data['bonds'].dtype != torch.long:
+                return f"bonds dtype is {data['bonds'].dtype}, expected long"
+            if data['bonds'].numel() != 0:
+                if int(data['bonds'][:, :2].min().item()) < 0:
+                    return "bonds contain negative atom indices"
+                if int(data['bonds'][:, :2].max().item()) >= n_atoms:
+                    return (
+                        f"bonds reference atom index {int(data['bonds'][:, :2].max().item())} "
+                        f"but sample has only {n_atoms} atoms"
+                    )
+        except Exception:
+            return "sample validation raised an unexpected exception"
+
+        return None
+
+    @staticmethod
+    def _is_valid_sample(data: Dict) -> bool:
+        return DynamicCIFDataset._sample_validation_error(data) is None
+
+    @staticmethod
+    def _sample_debug_id(data: Dict) -> str:
+        if not isinstance(data, dict):
+            return f"type={type(data)}"
+        cif_path = data.get('_cif_path', '?')
+        cif_name = os.path.basename(str(cif_path)) if cif_path != '?' else '?'
+        return (
+            f"cif={cif_name}, ligand={data.get('_ligand_id', '?')}, "
+            f"dataset_idx={data.get('_dataset_idx', '?')}, cif_idx={data.get('_cif_idx', '?')}"
+        )
     
-    def __getitem__(self, idx: int) -> Dict:
+    def _build_sample(self, idx: int) -> Dict:
         """
         Get a sample from the dataset.
         
@@ -420,8 +537,9 @@ class DynamicCIFDataset:
         Returns:
             Data dictionary with features for training/inference
         """
-        idx = self.dynamic_idxs[idx]
-        cif_path = self.cif_files[idx]
+        requested_idx = idx
+        cif_idx = self.dynamic_idxs[idx]
+        cif_path = self.cif_files[cif_idx]
         available_ligands = self.cif_ligand_ids[cif_path]
         
         # Sample ligand/threshold from the worker-local torch RNG so training
@@ -436,23 +554,20 @@ class DynamicCIFDataset:
         
         try:
             merged_cplx, receptor_cplx, ligand_cplx, receptor_blocks, ligand_blocks = \
-                self._load_cif_complex(idx, ligand_id)
+                self._load_cif_complex(cif_idx, ligand_id)
         except Exception as e:
-            print(f"Error loading CIF {os.path.basename(cif_path)}, ligand {ligand_id}: {e}")
-            # Return empty sample on error
-            return {
-                'X': torch.empty((0, 3), dtype=torch.float),
-                'S': torch.empty(0, dtype=torch.long),
-                'A': torch.empty(0, dtype=torch.long),
-                'position_ids': torch.empty(0, dtype=torch.long),
-                'chain_ids': torch.empty(0, dtype=torch.long),
-                'is_aa': torch.empty(0, dtype=torch.bool),
-                'block_lengths': torch.empty(0, dtype=torch.long),
-                'bonds': torch.empty((0, 3), dtype=torch.long),
-                'term_rel_pos': torch.empty((0, 15), dtype=torch.float),
-                'lengths': 0,
-                'pocket_th': pocket_th,
-            }
+            raise RuntimeError(
+                f"Error loading CIF {os.path.basename(cif_path)}, ligand {ligand_id}: {e}"
+            ) from e
+
+        if not receptor_blocks:
+            raise RuntimeError(
+                f"No receptor blocks parsed for CIF {os.path.basename(cif_path)}, ligand {ligand_id}"
+            )
+        if not ligand_blocks:
+            raise RuntimeError(
+                f"No ligand blocks parsed for CIF {os.path.basename(cif_path)}, ligand {ligand_id}"
+            )
         
         # Compute pocket using precomputed distances if available
         receptor_chain = list(receptor_cplx.id2idx.keys())[0]
@@ -494,24 +609,30 @@ class DynamicCIFDataset:
         try:
             data = transform_data(merged_cplx, all_select_indexes)
         except Exception as e:
-            print(f"Error transforming data: {e}")
-            return {
-                'X': torch.empty((0, 3), dtype=torch.float),
-                'S': torch.empty(0, dtype=torch.long),
-                'A': torch.empty(0, dtype=torch.long),
-                'position_ids': torch.empty(0, dtype=torch.long),
-                'chain_ids': torch.empty(0, dtype=torch.long),
-                'is_aa': torch.empty(0, dtype=torch.bool),
-                'block_lengths': torch.empty(0, dtype=torch.long),
-                'bonds': torch.empty((0, 3), dtype=torch.long),
-                'term_rel_pos': torch.empty((0, 15), dtype=torch.float),
-                'lengths': 0,
-                'pocket_th': pocket_th,
-            }
+            raise RuntimeError(
+                f"Error transforming CIF {os.path.basename(cif_path)}, ligand {ligand_id}: {e}"
+            ) from e
         
         # Add masks
         n_pocket_blocks = len(pocket_block_ids)
         n_ligand_blocks = len(ligand_blocks)
+        if n_pocket_blocks == 0:
+            raise RuntimeError(
+                f"No pocket blocks found for CIF {os.path.basename(cif_path)}, ligand {ligand_id}"
+            )
+        if n_ligand_blocks == 0:
+            raise RuntimeError(
+                f"No ligand blocks found for CIF {os.path.basename(cif_path)}, ligand {ligand_id}"
+            )
+        expected_blocks = n_pocket_blocks + n_ligand_blocks
+        if int(data['lengths']) != expected_blocks:
+            raise RuntimeError(
+                f"Selected block count mismatch for CIF {os.path.basename(cif_path)}, "
+                f"ligand {ligand_id}: selected {expected_blocks} blocks "
+                f"({n_pocket_blocks} pocket + {n_ligand_blocks} ligand), "
+                f"but transform_data kept {int(data['lengths'])}. This usually means "
+                "one selected block had no modeled heavy atoms."
+            )
         generate_mask = [0] * n_pocket_blocks + [1] * n_ligand_blocks
         center_mask = [1] * n_pocket_blocks + [0] * n_ligand_blocks
         
@@ -545,8 +666,45 @@ class DynamicCIFDataset:
         # Add metadata for CFG training and logging
         data['pocket_th'] = pocket_th
         data['cfg_eligible'] = n_pocket_blocks > 0  # Can this sample use CFG dropout?
+        data['_valid'] = True
+        data['_dataset_idx'] = requested_idx
+        data['_cif_idx'] = cif_idx
+        data['_cif_path'] = cif_path
+        data['_ligand_id'] = ligand_id
+
+        validation_error = self._sample_validation_error(data)
+        if validation_error is not None:
+            raise RuntimeError(
+                f"Invalid sample for CIF {os.path.basename(cif_path)}, "
+                f"ligand {ligand_id}: {validation_error}"
+            )
         
         return data
+
+    def __getitem__(self, idx: int) -> Dict:
+        last_error = ""
+        for attempt in range(self.max_sample_retries):
+            cur_idx = idx
+            if attempt > 0:
+                cur_idx = torch.randint(len(self), (1,)).item()
+            try:
+                data = self._build_sample(cur_idx)
+                if self._is_valid_sample(data):
+                    return data
+                last_error = self._sample_validation_error(data) or "sample failed schema/shape validation"
+            except Exception as e:
+                last_error = str(e)
+
+            if attempt == 0:
+                print(
+                    f"  Warning: Bad DynamicCIFDataset sample at dataset index {idx}: "
+                    f"{last_error}. Retrying with alternate samples."
+                )
+
+        return self._empty_sample(
+            f"Failed to build a valid sample after {self.max_sample_retries} attempts; "
+            f"last error: {last_error}"
+        )
     
     def collate_fn(self, batch: List[Dict]) -> Dict:
         """
@@ -558,14 +716,57 @@ class DynamicCIFDataset:
         Returns:
             Batched data dictionary
         """
+        target_batch_size = len(batch)
+        valid_batch = []
+        invalid_errors = []
+        for item in batch:
+            if self._is_valid_sample(item):
+                valid_batch.append(item)
+            else:
+                error = self._sample_validation_error(item)
+                if isinstance(item, dict) and item.get('_error'):
+                    error = item['_error']
+                invalid_errors.append(f"{self._sample_debug_id(item)}: {error}")
+
+        # A bad CIF/ligand should not crash a long run. Replace malformed items
+        # with alternate valid samples from the same dataset whenever possible.
+        replacement_budget = target_batch_size * self.max_sample_retries
+        while len(valid_batch) < target_batch_size and replacement_budget > 0:
+            replacement_budget -= 1
+            replacement_idx = torch.randint(len(self), (1,)).item()
+            replacement = self[replacement_idx]
+            if self._is_valid_sample(replacement):
+                valid_batch.append(replacement)
+
+        duplicated_replacements = 0
+        while len(valid_batch) < target_batch_size and valid_batch:
+            duplicate_idx = torch.randint(len(valid_batch), (1,)).item()
+            valid_batch.append(valid_batch[duplicate_idx])
+            duplicated_replacements += 1
+
+        if invalid_errors:
+            print(
+                f"  Warning: Replaced {len(invalid_errors)} invalid DynamicCIFDataset "
+                f"samples during collation. First error: {invalid_errors[0]}"
+            )
+
+        if not valid_batch:
+            raise RuntimeError(
+                "All DynamicCIFDataset samples in this batch were invalid, and no "
+                "valid replacement could be drawn. Please inspect the warned CIF/ligand cases."
+            )
+        if duplicated_replacements:
+            print(
+                f"  Warning: Duplicated {duplicated_replacements} valid "
+                "DynamicCIFDataset samples to preserve batch size after replacement attempts."
+            )
+
+        batch = valid_batch
         results = {}
-        for key in batch[0].keys():
+        for key in self.MODEL_KEYS:
             values = [item[key] for item in batch]
             
-            # Drop metadata fields from the model input batch.
-            if key in ['pocket_th', 'cfg_eligible']:
-                continue
-            elif key == 'lengths':
+            if key == 'lengths':
                 results[key] = torch.tensor(values, dtype=torch.long)
             elif key == 'bonds':
                 # Add atom offset to bond indices
