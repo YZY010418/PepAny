@@ -1,0 +1,5 @@
+*.log
+*.csv
+*.tsv
+*.prism
+.DS_Store
