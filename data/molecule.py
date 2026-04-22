@@ -54,6 +54,7 @@ class MoleculeDataset(PeptideDataset):
         data = transform_data(cplx, pocket_block_ids + lig_block_ids)
         data['generate_mask'] = torch.tensor(generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(center_mask, dtype=torch.bool)
+        data['term_rel_pos'] = torch.zeros((int(data['lengths']), 15), dtype=torch.float)
         # set position ids of small molecules to zero
         data['position_ids'][data['generate_mask']] = 0
         

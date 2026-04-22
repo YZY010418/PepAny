@@ -123,7 +123,7 @@ class LDMMolDesign(nn.Module):
         batch_size = lengths.shape[0]
         cfg_mask = torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio  # [batch_size]
         cfg_mask = cfg_mask[batch_ids]  # [Nblock], broadcast to blocks
-        term_pos_embedding = self.term_pos_proj(term_rel_pos)
+        term_pos_embedding = self._term_pos_embedding(term_rel_pos)
         term_pos_embedding = torch.where(
             cfg_mask.unsqueeze(-1),  # [Nblock, 1]
             torch.zeros_like(term_pos_embedding),
@@ -146,6 +146,15 @@ class LDMMolDesign(nn.Module):
         loss_dict['total'] = loss_dict['H'] * self.h_loss_weight + loss_dict['X']
 
         return loss_dict
+
+    def _term_pos_embedding(self, term_rel_pos):
+        term_pos_embedding = self.term_pos_proj(term_rel_pos)
+        has_term_condition = term_rel_pos.abs().sum(dim=-1, keepdim=True) > 0
+        return torch.where(
+            has_term_condition,
+            term_pos_embedding,
+            torch.zeros_like(term_pos_embedding)
+        )
 
     # def latent_geometry_guidance(self, X, generate_mask, batch_ids, tolerance=3, **kwargs):
     #     assert self.consec_dist_mean is not None and self.consec_dist_std is not None, \
@@ -218,7 +227,9 @@ class LDMMolDesign(nn.Module):
             return_tensor=False,
         ):
 
+        sample_opt = dict(sample_opt)
         vae_decode_n_iter = sample_opt.pop('vae_decode_n_iter', 10)
+        guidance_scale = sample_opt.pop('guidance_scale', self.guidance_scale)
 
         block_ids = length_to_batch_id(block_lengths)
 
@@ -257,7 +268,7 @@ class LDMMolDesign(nn.Module):
         is_aa_embedding = self.is_aa_embed(is_aa.long())
 
         # terminal relative position embedding
-        term_pos_embedding = self.term_pos_proj(term_rel_pos)
+        term_pos_embedding = self._term_pos_embedding(term_rel_pos)
         term_pos_embedding_uncond = torch.zeros_like(term_pos_embedding)
         
         # condition embedding
@@ -269,7 +280,7 @@ class LDMMolDesign(nn.Module):
             X=Zx,
             cond_embedding=cond_embedding_full,
             cond_embedding_uncond=cond_embedding_null,
-            guidance_scale=self.guidance_scale,
+            guidance_scale=guidance_scale,
             chain_ids=chain_ids,
             generate_mask=generate_mask,
             lengths=lengths,
@@ -287,5 +298,6 @@ class LDMMolDesign(nn.Module):
             X=X, S=S, A=A, bonds=bonds, position_ids=position_ids,
             chain_ids=chain_ids, generate_mask=generate_mask, block_lengths=block_lengths,
             lengths=lengths, is_aa=is_aa, given_latent=(H_0, X_0, None),
-            n_iter=vae_decode_n_iter, topo_generate_mask=generate_mask
+            n_iter=vae_decode_n_iter, topo_generate_mask=generate_mask,
+            term_rel_pos=term_rel_pos, guidance_scale=guidance_scale
         )

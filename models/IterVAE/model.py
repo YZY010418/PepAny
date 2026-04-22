@@ -255,21 +255,27 @@ class CondIterAutoEncoder(nn.Module):
 
         topo_edge_attr = self.atom_edge_embedding(topo_edge_type)
 
-        # Apply CFG dropout to terminal position condition
-        if term_rel_pos is not None and self.training:
+        # Apply CFG dropout after projection so a dropped condition is truly zero.
+        term_pos_embedding = None
+        if term_rel_pos is not None:
+            term_pos_embedding = self._term_pos_embedding(term_rel_pos, block_ids)
+        if term_pos_embedding is not None and self.training:
             batch_size = lengths.shape[0]
             cfg_mask = torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio
-            cfg_mask = cfg_mask[batch_ids]  # [Nblock], broadcast to blocks
-            term_rel_pos = torch.where(
+            cfg_mask = cfg_mask[batch_ids][block_ids]  # [Natom], broadcast to atoms
+            term_pos_embedding = torch.where(
                 cfg_mask.unsqueeze(-1),
-                torch.zeros_like(term_rel_pos),
-                term_rel_pos
+                torch.zeros_like(term_pos_embedding),
+                term_pos_embedding
             )
-        else:
-            term_rel_pos_input = term_rel_pos
 
         # decode structure
-        H_t, X_next = self.decode_structure(Zh, X_t, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t, term_rel_pos=term_rel_pos)
+        H_t, X_next = self.decode_structure(
+            Zh, X_t, A, position_ids, topo_edges, topo_edge_attr,
+            chain_ids, batch_ids, block_ids, t,
+            term_rel_pos=term_rel_pos,
+            term_pos_embedding=term_pos_embedding
+        )
         pred_vector = X_next - X_t
         X_final = X_t + pred_vector * t[:, None] # for local neighborhood
         # decode inter-block bonds
@@ -409,7 +415,16 @@ class CondIterAutoEncoder(nn.Module):
         pred_block_logits = self.block_type_mlp(block_h)
         return pred_block_logits
 
-    def decode_structure(self, Zh, X, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t, term_rel_pos=None):
+    def _term_pos_embedding(self, term_rel_pos, block_ids):
+        term_pos_embedding = self.dec_term_pos_proj(term_rel_pos[block_ids])
+        has_term_condition = term_rel_pos[block_ids].abs().sum(dim=-1, keepdim=True) > 0
+        return torch.where(
+            has_term_condition,
+            term_pos_embedding,
+            torch.zeros_like(term_pos_embedding)
+        )
+
+    def decode_structure(self, Zh, X, A, position_ids, topo_edges, topo_edge_attr, chain_ids, batch_ids, block_ids, t, term_rel_pos=None, term_pos_embedding=None):
         '''
             Args:
                 Zh: [Nblock, latent_size]
@@ -426,12 +441,12 @@ class CondIterAutoEncoder(nn.Module):
         # decode atom-level structures
         edges, edge_type = self.get_edges(batch_ids, chain_ids, X, block_ids, None, True, True)
         edge_attr = self.edge_embedding(edge_type)
-        if term_rel_pos is None:
+        if term_pos_embedding is None and term_rel_pos is None:
             term_pos_embedding = Zh.new_zeros(
                 (block_ids.shape[0], self.dec_term_pos_proj.out_features)
             )
-        else:
-            term_pos_embedding = self.dec_term_pos_proj(term_rel_pos[block_ids])
+        elif term_pos_embedding is None:
+            term_pos_embedding = self._term_pos_embedding(term_rel_pos, block_ids)
 
         H = self.dec_input_linear(torch.cat([
             self.dec_atom_embedding(A),
@@ -766,9 +781,11 @@ class CondIterAutoEncoder(nn.Module):
         return_x_only=False,# return x only (used in validation)
         topo_generate_mask=None,
         term_rel_pos=None,
-        guidance_scale=1.5,
+        guidance_scale=None,
         **kwargs
     ):
+        if guidance_scale is None:
+            guidance_scale = self.guidance_scale
         
         # if self.discrete_timestep: assert n_iter == self.default_num_steps
         if 'given_latent' in kwargs:
@@ -843,7 +860,7 @@ class CondIterAutoEncoder(nn.Module):
             pred_vector_uncond = X_next_uncond - X_t
             
             # CFG: blend velocities
-            pred_vector = pred_vector_uncond + self.guidance_scale * (pred_vector_cond - pred_vector_uncond)
+            pred_vector = pred_vector_uncond + guidance_scale * (pred_vector_cond - pred_vector_uncond)
             X_t = X_t + pred_vector * span # update
             X_t = _avoid_clash(A, X_t, batch_ids, block_ids, chain_ids, generate_mask, is_aa)
             all_vectors.append(pred_vector)

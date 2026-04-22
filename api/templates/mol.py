@@ -27,6 +27,8 @@ class Molecule(BaseTemplate):
     def set_control(self, data):
         data['is_aa'][data['generate_mask']] = False
         data['position_ids'][data['generate_mask']] = 0
+        if 'term_rel_pos' in data:
+            data['term_rel_pos'].zero_()
         return data
     
     def validate(self, cplx_desc):

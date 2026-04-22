@@ -3,11 +3,13 @@
 import os
 from typing import List
 
+import numpy as np
 import torch
 
 from data.bioparse.parser.pdb_to_complex import pdb_to_complex
 from data.bioparse.interface import compute_pocket
 from data.base import transform_data
+from data.peptide import compute_terminal_rel_pos
 
 from .templates import BaseTemplate, ComplexDesc
 
@@ -29,6 +31,8 @@ class PDBDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         idx = idx // self.n_samples
         cplx, pocket_block_ids = self.cplxs[idx], self.pocket_block_ids[idx]
+        lig_chain = self.lig_chains[idx][0]
+        lig_term_rel_pos = compute_terminal_rel_pos(list(cplx[lig_chain]))
 
         # edit the cplx with template (create new cplx of ligand and merge)
         cplx_desc = self.config(ComplexDesc(
@@ -44,6 +48,10 @@ class PDBDataset(torch.utils.data.Dataset):
         data = transform_data(cplx_desc.cplx, pocket_block_ids + dummy_lig_block_ids)
         data['generate_mask'] = torch.tensor(cplx_desc.generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(cplx_desc.center_mask, dtype=torch.bool)
+        term_rel_pos = np.zeros((int(data['lengths']), 15), dtype=np.float32)
+        if len(dummy_lig_block_ids):
+            term_rel_pos[-len(dummy_lig_block_ids):] = lig_term_rel_pos
+        data['term_rel_pos'] = torch.tensor(term_rel_pos, dtype=torch.float)
         if cplx_desc.topo_generate_mask is not None:
             data['topo_generate_mask'] = torch.tensor(cplx_desc.topo_generate_mask, dtype=torch.bool)
 

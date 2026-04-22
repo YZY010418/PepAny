@@ -59,15 +59,17 @@ def clamp_coord(coord):
     return new_coord
 
 
-def generate_wrapper(model, sample_opt={}, guidance_scale=1.5):
+def generate_wrapper(model, sample_opt=None, guidance_scale=1.5):
+    sample_opt = {} if sample_opt is None else dict(sample_opt)
     if isinstance(model, models.CondIterAutoEncoder):
         def wrapper(batch):
             batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = model.generate(**batch,guidance_scale=guidance_scale)
             return batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds
     elif isinstance(model, models.LDMMolDesign):# or isinstance(model, models.LFMMolDesign):
         def wrapper(batch):
-            sample_opt['guidance_scale'] = guidance_scale 
-            res_tuple = model.sample(sample_opt=sample_opt, **batch)
+            cur_sample_opt = dict(sample_opt)
+            cur_sample_opt['guidance_scale'] = guidance_scale 
+            res_tuple = model.sample(sample_opt=cur_sample_opt, **batch)
             if len(res_tuple) == 6:
                 batch_S, batch_X, batch_A, batch_ll, batch_bonds, batch_intra_bonds = res_tuple
             else:

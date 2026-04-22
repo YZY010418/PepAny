@@ -85,39 +85,6 @@ def _relative_term_feature(n_term_descriptor, c_term_descriptor):
         return _zero_term_rel_pos()
 
 
-def compute_term_rel_pos(block_n, block, block_c):
-    """Compute a per-block neighboring-amide feature."""
-    try:
-        c_ac = _get_atom_coord(block_n, 'C')
-        c_n = _get_atom_coord(block, 'C')
-        o_n = _get_atom_coord(block, 'O')
-        n_n = _get_atom_coord(block, 'N')
-        ca_n = _get_atom_coord(block, 'CA')
-        
-        ca_c = _get_atom_coord(block, 'CA')
-        c_c = _get_atom_coord(block, 'C')
-        o_c = _get_atom_coord(block, 'O')
-        n_c = _get_atom_coord(block_c, 'N')
-        ca_cn = _get_atom_coord(block_c, 'CA')
-        
-        if any(x is None for x in [c_n, o_n, n_n, ca_n, c_c, o_c]):
-            return _zero_term_rel_pos()
-        
-        if c_ac is not None:
-            n_descriptor = terminal_descriptor(c_ac, c_n, o_n, n_n, ca_n)
-        else:
-            n_descriptor = (np.zeros(3), np.zeros(3), ca_n)
-        
-        if ca_cn is not None:
-            c_descriptor = terminal_descriptor(ca_c, c_c, o_c, n_c, ca_cn)
-        else:
-            c_descriptor = (np.zeros(3), np.zeros(3), ca_c)
-        
-        return _relative_term_feature(n_descriptor, c_descriptor)
-    except:
-        return _zero_term_rel_pos()
-
-
 def compute_terminal_rel_pos(blocks):
     """Compute one condition from ACE-first and last-NME peptide-bond amide planes."""
     try:
