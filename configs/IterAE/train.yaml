@@ -30,7 +30,7 @@ trainer:
   class: IterAETrainer
   criterion: loss
   config:
-    max_epoch: 100
+    max_epoch: 60
     save_topk: 10
     val_freq: 1
     save_dir: ./ckpts/pepany
