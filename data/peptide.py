@@ -119,21 +119,18 @@ def compute_term_rel_pos(block_n, block, block_c):
 
 
 def compute_terminal_rel_pos(blocks):
-    """Compute one condition from the first and last valid peptide-bond amide planes."""
+    """Compute one condition from ACE-first and last-NME peptide-bond amide planes."""
     try:
         blocks = list(blocks)
         if len(blocks) < 2:
             return _zero_term_rel_pos()
 
-        descriptors = [
-            _peptide_bond_amide_descriptor(blocks[i], blocks[i + 1])
-            for i in range(len(blocks) - 1)
-        ]
-        descriptors = [descriptor for descriptor in descriptors if descriptor is not None]
-        if not descriptors:
+        n_term_descriptor = _peptide_bond_amide_descriptor(blocks[0], blocks[1])
+        c_term_descriptor = _peptide_bond_amide_descriptor(blocks[-2], blocks[-1])
+        if n_term_descriptor is None or c_term_descriptor is None:
             return _zero_term_rel_pos()
 
-        return _relative_term_feature(descriptors[0], descriptors[-1])
+        return _relative_term_feature(n_term_descriptor, c_term_descriptor)
     except:
         return _zero_term_rel_pos()
 
