@@ -11,6 +11,19 @@ import torch
 from .base import BaseDataset, Summary, transform_data
 
 # some helper functions for terminal positions
+def _get_atom_coord(blk, atom_name):
+    if blk is None:
+        return None
+    for atom in blk:
+        if atom.name == atom_name:
+            return np.array(atom.get_coord(), dtype=np.float32)
+    return None
+
+
+def _zero_term_rel_pos():
+    return np.zeros(15, dtype=np.float32)
+
+
 def terminal_descriptor(p1, p2, p3, p4, p5):
     """Compute direction, normal, and center of a 5-point plane"""
     direction = p1 - p5
@@ -30,40 +43,26 @@ def terminal_descriptor(p1, p2, p3, p4, p5):
     
     return direction, norm, center
 
-def compute_term_rel_pos(block_n, block, block_c):
-    """Compute 15-dim terminal relative position feature"""
+
+def _peptide_bond_amide_descriptor(block_left, block_right):
+    """Descriptor for the amide plane between two adjacent residue blocks."""
+    atoms = [
+        _get_atom_coord(block_left, 'CA'),
+        _get_atom_coord(block_left, 'C'),
+        _get_atom_coord(block_left, 'O'),
+        _get_atom_coord(block_right, 'N'),
+        _get_atom_coord(block_right, 'CA'),
+    ]
+    if any(x is None for x in atoms):
+        return None
+    return terminal_descriptor(*atoms)
+
+
+def _relative_term_feature(n_term_descriptor, c_term_descriptor):
+    """Convert two terminal amide descriptors into the 15-d invariant feature."""
     try:
-        def get_atom_coord(blk, atom_name):
-            for atom in blk:
-                if atom.name == atom_name:
-                    return np.array(atom.get_coord(), dtype=np.float32)
-            return None
-        
-        c_ac = get_atom_coord(block_n, 'C') if block_n else None
-        c_n = get_atom_coord(block, 'C')
-        o_n = get_atom_coord(block, 'O')
-        n_n = get_atom_coord(block, 'N')
-        ca_n = get_atom_coord(block, 'CA')
-        
-        ca_c = get_atom_coord(block, 'CA')
-        c_c = get_atom_coord(block, 'C')
-        o_c = get_atom_coord(block, 'O')
-        n_c = get_atom_coord(block_c, 'N') if block_c else None
-        ca_cn = get_atom_coord(block_c, 'CA') if block_c else None
-        
-        if any(x is None for x in [c_n, o_n, n_n, ca_n, c_c, o_c]):
-            return np.zeros(15, dtype=np.float32)
-        
-        if c_ac is not None:
-            d_n, norm_n, center_n = terminal_descriptor(c_ac, c_n, o_n, n_n, ca_n)
-        else:
-            d_n, norm_n, center_n = np.zeros(3), np.zeros(3), get_atom_coord(block, 'CA') # make the process smooth
-        
-        if ca_cn is not None:
-            d_c, norm_c, center_c = terminal_descriptor(ca_c, c_c, o_c, n_c, ca_cn)
-        else:
-            d_c, norm_c, center_c = np.zeros(3), np.zeros(3), get_atom_coord(block, 'CA')
-        
+        d_n, norm_n, center_n = n_term_descriptor
+        d_c, norm_c, center_c = c_term_descriptor
         d = np.linalg.norm(center_n - center_c)
         r = (center_n - center_c) / (d + 1e-8) if d > 1e-6 else np.zeros(3)
         
@@ -83,7 +82,60 @@ def compute_term_rel_pos(block_n, block, block_c):
         
         return np.concatenate([np.array([d], dtype=np.float32), dots, triples])
     except:
-        return np.zeros(15, dtype=np.float32)
+        return _zero_term_rel_pos()
+
+
+def compute_term_rel_pos(block_n, block, block_c):
+    """Compute a per-block neighboring-amide feature."""
+    try:
+        c_ac = _get_atom_coord(block_n, 'C')
+        c_n = _get_atom_coord(block, 'C')
+        o_n = _get_atom_coord(block, 'O')
+        n_n = _get_atom_coord(block, 'N')
+        ca_n = _get_atom_coord(block, 'CA')
+        
+        ca_c = _get_atom_coord(block, 'CA')
+        c_c = _get_atom_coord(block, 'C')
+        o_c = _get_atom_coord(block, 'O')
+        n_c = _get_atom_coord(block_c, 'N')
+        ca_cn = _get_atom_coord(block_c, 'CA')
+        
+        if any(x is None for x in [c_n, o_n, n_n, ca_n, c_c, o_c]):
+            return _zero_term_rel_pos()
+        
+        if c_ac is not None:
+            n_descriptor = terminal_descriptor(c_ac, c_n, o_n, n_n, ca_n)
+        else:
+            n_descriptor = (np.zeros(3), np.zeros(3), ca_n)
+        
+        if ca_cn is not None:
+            c_descriptor = terminal_descriptor(ca_c, c_c, o_c, n_c, ca_cn)
+        else:
+            c_descriptor = (np.zeros(3), np.zeros(3), ca_c)
+        
+        return _relative_term_feature(n_descriptor, c_descriptor)
+    except:
+        return _zero_term_rel_pos()
+
+
+def compute_terminal_rel_pos(blocks):
+    """Compute one condition from the first and last valid peptide-bond amide planes."""
+    try:
+        blocks = list(blocks)
+        if len(blocks) < 2:
+            return _zero_term_rel_pos()
+
+        descriptors = [
+            _peptide_bond_amide_descriptor(blocks[i], blocks[i + 1])
+            for i in range(len(blocks) - 1)
+        ]
+        descriptors = [descriptor for descriptor in descriptors if descriptor is not None]
+        if not descriptors:
+            return _zero_term_rel_pos()
+
+        return _relative_term_feature(descriptors[0], descriptors[-1])
+    except:
+        return _zero_term_rel_pos()
 
 
 @R.register('PeptideDataset')
@@ -160,20 +212,16 @@ class PeptideDataset(BaseDataset):
         data['generate_mask'] = torch.tensor(summary.generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(summary.center_mask, dtype=torch.bool)
         
-        # Add term_rel_pos for peptide blocks (last part after pocket)
+        # Add one endpoint-amide condition and copy it to every peptide block.
         pep_chain = summary.ligand_chain_ids[0]
-        pep_blocks = cplx[pep_chain]
-        term_pos_list = []
-        for i, block in enumerate(pep_blocks):
-            block_n = pep_blocks[i-1] if i > 0 else None
-            block_c = pep_blocks[i+1] if i < len(pep_blocks)-1 else None
-            term_pos_list.append(compute_term_rel_pos(block_n, block, block_c))
+        pep_blocks = list(cplx[pep_chain])
         
         # Pad pocket blocks with zeros
         n_pocket_blocks = len(summary.select_indexes) - len(pep_blocks)
+        peptide_term_rel_pos = compute_terminal_rel_pos(pep_blocks)
         term_rel_pos = np.concatenate([
             np.zeros((n_pocket_blocks, 15), dtype=np.float32),
-            np.array(term_pos_list, dtype=np.float32)
+            np.repeat(peptide_term_rel_pos[None, :], len(pep_blocks), axis=0)
         ])
         
         data['term_rel_pos'] = torch.tensor(term_rel_pos, dtype=torch.float)

@@ -31,10 +31,7 @@ from data.bioparse.utils import recur_index
 from data.bioparse.interface import compute_pocket
 from data.bioparse.vocab import VOCAB
 from data.base import transform_data, blocks_to_data
-from data.peptide import (
-    terminal_descriptor,
-    compute_term_rel_pos
-)
+from data.peptide import compute_terminal_rel_pos
 from data.resample import ClusterResampler
 
 
@@ -639,19 +636,13 @@ class DynamicCIFDataset:
         data['generate_mask'] = torch.tensor(generate_mask, dtype=torch.bool)
         data['center_mask'] = torch.tensor(center_mask, dtype=torch.bool)
         
-        # Compute terminal positions for ligand blocks
-        term_pos_list = []
-        
-        # Pocket: zeros
-        for _ in range(n_pocket_blocks):
-            term_pos_list.append(np.zeros(15, dtype=np.float32))
-        
-        # Ligand: compute terminal positions
-        for i, block in enumerate(ligand_blocks):
-            block_n = ligand_blocks[i-1] if i > 0 else None
-            block_c = ligand_blocks[i+1] if i < len(ligand_blocks)-1 else None
-            term_pos_list.append(compute_term_rel_pos(block_n, block, block_c))
-        
+        # Compute one endpoint-amide condition and copy it to every ligand block.
+        ligand_term_rel_pos = compute_terminal_rel_pos(ligand_blocks)
+        term_pos_list = [
+            *[np.zeros(15, dtype=np.float32) for _ in range(n_pocket_blocks)],
+            *[ligand_term_rel_pos for _ in range(n_ligand_blocks)],
+        ]
+
         data['term_rel_pos'] = torch.tensor(
             np.array(term_pos_list, dtype=np.float32),
             dtype=torch.float
