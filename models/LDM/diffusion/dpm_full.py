@@ -135,8 +135,8 @@ class FullDPM(nn.Module):
         #     L = L / self.std
         batch_ids = length_to_batch_id(lengths)
         batch_size = batch_ids.max() + 1
-        if t == None: # sample time step
-            t = torch.randint(0, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
+        if t is None: # sample time step
+            t = torch.randint(1, self.num_steps + 1, (batch_size,), dtype=torch.long, device=H_0.device)
 
         X_noisy, eps_X = self.trans_x.add_noise(X_0, generate_mask, batch_ids, t)
         H_noisy, eps_H = self.trans_h.add_noise(H_0, generate_mask, batch_ids, t)

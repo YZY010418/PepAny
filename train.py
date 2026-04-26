@@ -9,6 +9,7 @@ import torch
 from utils.logger import print_log
 from utils.random_seed import setup_seed, SEED
 from utils.config_utils import overwrite_values
+from utils.io import torch_load_full
 from utils import register as R
 
 ########### Import your packages below ##########
@@ -42,7 +43,7 @@ def main(args, opt_args):
     ########## define your model #########
     model = R.construct(config['model'])
     if len(config.get('load_ckpt', '')):
-        model.load_state_dict(torch.load(config['load_ckpt'], map_location='cpu').state_dict())
+        model.load_state_dict(torch_load_full(config['load_ckpt'], map_location='cpu').state_dict())
         print_log(f'Loaded weights from {config["load_ckpt"]}')
 
     ########### load your train / valid set ###########

@@ -20,6 +20,7 @@ from data.base import Summary, transform_data
 from data import create_dataloader, create_dataset
 from utils.logger import print_log
 from utils.random_seed import setup_seed
+from utils.io import torch_load_full
 from models.LDM.data_utils import Recorder, OverwriteTask, _get_item
 
 
@@ -142,7 +143,7 @@ def main(args, opt_args):
     b_ckpt = args.ckpt if args.ckpt.endswith('.ckpt') else get_best_ckpt(args.ckpt)
     ckpt_dir = os.path.split(os.path.split(b_ckpt)[0])[0]
     print(f'Using checkpoint {b_ckpt}')
-    model = torch.load(b_ckpt, map_location='cpu')
+    model = torch_load_full(b_ckpt, map_location='cpu')
     device = torch.device('cpu' if args.gpu == -1 else f'cuda:{args.gpu}')
     model.to(device)
     model.eval()

@@ -10,6 +10,7 @@ import utils.register as R
 from utils.oom_decorator import oom_decorator
 from utils.nn_utils import SinusoidalPositionEmbedding
 from utils.gnn_utils import length_to_batch_id, std_conserve_scatter_mean
+from utils.io import torch_load_full
 
 from .diffusion.dpm_full import FullDPM
 from ..IterVAE.model import CondIterAutoEncoder
@@ -35,7 +36,7 @@ class LDMMolDesign(nn.Module):
         super().__init__()
         self.latent_deterministic = latent_deterministic
 
-        self.autoencoder: CondIterAutoEncoder = torch.load(autoencoder_ckpt, map_location='cpu')
+        self.autoencoder: CondIterAutoEncoder = torch_load_full(autoencoder_ckpt, map_location='cpu')
         for param in self.autoencoder.parameters():
             param.requires_grad = False
         self.autoencoder.eval()
@@ -114,7 +115,10 @@ class LDMMolDesign(nn.Module):
         topo_embedding = self.topo_embedding(A, bonds, length_to_batch_id(block_lengths), generate_mask)
 
         # is aa embedding (sample 50% for generation part)
-        corrupt_mask = generate_mask & (torch.rand_like(is_aa, dtype=torch.float) < self.is_aa_corrupt_ratio)
+        if self.training:
+            corrupt_mask = generate_mask & (torch.rand_like(is_aa, dtype=torch.float) < self.is_aa_corrupt_ratio)
+        else:
+            corrupt_mask = torch.zeros_like(is_aa, dtype=torch.bool)
         is_aa_embedding = self.is_aa_embed(
             torch.where(corrupt_mask, torch.zeros_like(is_aa), is_aa).long()
         )

@@ -176,6 +176,8 @@ class Trainer:
         
         # judge
         valid_metric = self._aggregate_val_metric(metric_arr)
+        if self.sched_freq == 'val_epoch':
+            self.scheduler.step(valid_metric)
         if self._is_main_proc():
             save_path = os.path.join(self.model_dir, f'epoch{self.epoch}_step{self.global_step}.ckpt')
             module_to_save = self.model.module if self.local_rank == 0 else self.model

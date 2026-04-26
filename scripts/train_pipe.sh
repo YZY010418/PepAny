@@ -130,6 +130,12 @@ echo "Using Autoencoder checkpoint: ${AE_CKPT}" >> $OUTLOG
 if [ "$TRAIN_LDM_FLAG" = "1" ]; then
     if  [ -z $LDM_UPDATE_MAX_EPOCH ] || [ $LDM_UPDATE_MAX_EPOCH -gt 0 ]; then
         bash scripts/train.sh $LDMCONFIG --trainer.config.save_dir=$LDM_SAVE_DIR --model.autoencoder_ckpt=$AE_CKPT $ARGS2 $LDM_CONTINUE_ARGS
+        if [ $? -eq 0 ]; then
+            echo "Succeeded in training LDM"
+        else
+            echo "Failed to train LDM"
+            exit 1;
+        fi
     else
         echo "LDM already finished training"
     fi
