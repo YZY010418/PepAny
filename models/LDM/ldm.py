@@ -121,7 +121,11 @@ class LDMMolDesign(nn.Module):
 
         # term_rel_pos_embedding
         batch_size = lengths.shape[0]
-        cfg_mask = torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio  # [batch_size]
+        cfg_mask = (
+            torch.rand(batch_size, device=term_rel_pos.device) < self.cfg_dropout_ratio
+            if self.training else
+            torch.zeros(batch_size, dtype=torch.bool, device=term_rel_pos.device)
+        )  # [batch_size]
         cfg_mask = cfg_mask[batch_ids]  # [Nblock], broadcast to blocks
         term_pos_embedding = self._term_pos_embedding(term_rel_pos)
         term_pos_embedding = torch.where(

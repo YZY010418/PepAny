@@ -875,7 +875,9 @@ class CondIterAutoEncoder(nn.Module):
 
         # bonds
         row, col = self._get_inter_block_nbh(X, batch_ids, block_ids, topo_generate_mask, dist_th=3.5)
-        pred_bond_logits = self.bond_type_mlp(H_t[row] + H_t[col]) # [E, 5], commutative property
+        pred_bond_logits_cond = self.bond_type_mlp(H_t_cond[row] + H_t_cond[col]) # [E, 5], commutative property
+        pred_bond_logits_uncond = self.bond_type_mlp(H_t_uncond[row] + H_t_uncond[col])
+        pred_bond_logits = pred_bond_logits_uncond + guidance_scale * (pred_bond_logits_cond - pred_bond_logits_uncond)
         pred_bond_probs = F.softmax(pred_bond_logits, dim=-1) # [E, 5]
         has_bond_mask = torch.argmax(pred_bond_probs, dim=-1) != 0
         pred_bond_probs = pred_bond_probs[has_bond_mask] # [E', 5], not None bond
