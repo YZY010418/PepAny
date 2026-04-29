@@ -34,6 +34,8 @@ WORKER_REF_INDEXES = None
 WORKER_REF_COORDS = None
 WORKER_INPUT_DIR = None
 WORKER_GEN_INDEXES = None
+WORKER_REF_CA_DISTANCE_SLOTS = (0, 9)
+WORKER_GEN_CA_DISTANCE_SLOTS = (0, 9)
 WORKER_MOL_INDEX = 0
 WORKER_MERGE = False
 WORKER_MERGE_OUTPUT_DIR = None
@@ -145,6 +147,26 @@ def parse_args():
         type=int,
         default=1,
         help='Number of SDF files sent to each worker at a time. Default: 1'
+    )
+    parser.add_argument(
+        '--ref-ca-distance-slots',
+        nargs=2,
+        type=int,
+        default=(0, 9),
+        metavar=('SLOT_A', 'SLOT_B'),
+        help=(
+            'Two 0-based positions in the 10 reference terminal-index list used '
+            'for the ACE.CA/NME.CA distance. Default: 0 9 for normal order. '
+            'For crossed reference order, usually use: 4 5.'
+        )
+    )
+    parser.add_argument(
+        '--gen-ca-distance-slots',
+        nargs=2,
+        type=int,
+        default=(0, 9),
+        metavar=('SLOT_A', 'SLOT_B'),
+        help='Two 0-based positions in the 10 generated terminal-index list. Default: 0 9.'
     )
     return parser.parse_args()
 
@@ -276,6 +298,23 @@ def rmsd(a, b):
     return float(np.sqrt(np.mean(np.sum((a - b) ** 2, axis=-1))))
 
 
+def validate_slot_pair(slots, label):
+    slots = tuple(int(slot) for slot in slots)
+    if len(slots) != 2:
+        raise ValueError(f'{label} must contain exactly two slots')
+    bad = [slot for slot in slots if slot < 0 or slot >= 10]
+    if bad:
+        raise ValueError(f'{label} slots must be in [0, 9], got {bad}')
+    if slots[0] == slots[1]:
+        raise ValueError(f'{label} slots must refer to two different atoms')
+    return slots
+
+
+def pair_distance(coords, slots):
+    idx_a, idx_b = slots
+    return float(np.linalg.norm(coords[idx_a] - coords[idx_b]))
+
+
 def collect_sdf_paths(input_dir, pattern, recursive):
     input_dir = Path(input_dir)
     iterator = input_dir.rglob(pattern) if recursive else input_dir.glob(pattern)
@@ -342,6 +381,27 @@ def remove_atoms_with_map(mol, remove_indexes):
     return rw_mol.GetMol(), old_to_new
 
 
+def heavy_atom_mol_with_map(mol):
+    remove_indexes = [
+        atom.GetIdx()
+        for atom in mol.GetAtoms()
+        if atom.GetSymbol().upper() in {'H', 'D'}
+    ]
+    if not remove_indexes:
+        return Chem.Mol(mol), {idx: idx for idx in range(mol.GetNumAtoms())}
+    return remove_atoms_with_map(mol, remove_indexes)
+
+
+def remap_indexes(indexes, old_to_new, label):
+    remapped = []
+    for idx in indexes:
+        idx = int(idx)
+        if idx not in old_to_new:
+            raise ValueError(f'{label} atom index {idx} is hydrogen/deuterium and cannot be used for terminal merge')
+        remapped.append(old_to_new[idx])
+    return remapped
+
+
 def merge_terminal_cap(ref_mol, ref_indexes, gen_mol, gen_indexes):
     """Merge an aligned reference cap into a DeNovoCappedLinearPeptide output.
 
@@ -350,6 +410,11 @@ def merge_terminal_cap(ref_mol, ref_indexes, gen_mol, gen_indexes):
     generated C side. Each group must keep the standard order
     [carbonyl_CA, carbonyl_C, carbonyl_O, amide_N, amide_CA].
     """
+    ref_mol, ref_old_to_new = heavy_atom_mol_with_map(ref_mol)
+    gen_mol, gen_old_to_new = heavy_atom_mol_with_map(gen_mol)
+    ref_indexes = remap_indexes(ref_indexes, ref_old_to_new, 'Reference')
+    gen_indexes = remap_indexes(gen_indexes, gen_old_to_new, 'Generated')
+
     ref_to_gen_n = list(ref_indexes[:5])
     ref_to_gen_c = list(ref_indexes[5:])
     gen_n = list(gen_indexes[:5])
@@ -538,6 +603,8 @@ def init_worker(
         ref_indexes,
         input_dir,
         gen_indexes,
+        ref_ca_distance_slots,
+        gen_ca_distance_slots,
         mol_index,
         merge,
         merge_output_dir,
@@ -553,6 +620,8 @@ def init_worker(
     global WORKER_REF_COORDS
     global WORKER_INPUT_DIR
     global WORKER_GEN_INDEXES
+    global WORKER_REF_CA_DISTANCE_SLOTS
+    global WORKER_GEN_CA_DISTANCE_SLOTS
     global WORKER_MOL_INDEX
     global WORKER_MERGE
     global WORKER_MERGE_OUTPUT_DIR
@@ -568,6 +637,12 @@ def init_worker(
     WORKER_REF_COORDS = get_positions(WORKER_REF_MOL, WORKER_REF_INDEXES)
     WORKER_INPUT_DIR = Path(input_dir)
     WORKER_GEN_INDEXES = None if gen_indexes is None else list(gen_indexes)
+    WORKER_REF_CA_DISTANCE_SLOTS = validate_slot_pair(
+        ref_ca_distance_slots, '--ref-ca-distance-slots'
+    )
+    WORKER_GEN_CA_DISTANCE_SLOTS = validate_slot_pair(
+        gen_ca_distance_slots, '--gen-ca-distance-slots'
+    )
     WORKER_MOL_INDEX = int(mol_index)
     WORKER_MERGE = bool(merge)
     WORKER_MERGE_OUTPUT_DIR = None if merge_output_dir is None else Path(merge_output_dir)
@@ -579,7 +654,12 @@ def init_worker(
 
 
 def merge_csv_fieldnames(merge):
-    fieldnames = ['file', 'rmsd', 'n_term_rmsd', 'c_term_rmsd', 'error']
+    fieldnames = [
+        'file', 'rmsd', 'n_term_rmsd', 'c_term_rmsd',
+        'ref_nme_ace_ca_distance', 'gen_nme_ace_ca_distance',
+        'nme_ace_ca_distance_deviation', 'nme_ace_ca_distance_abs_deviation',
+        'error'
+    ]
     if merge:
         fieldnames.extend([
             'merge_status', 'merge_file', 'self_clash_count',
@@ -595,6 +675,10 @@ def empty_result_row(sdf_path):
         'rmsd': '',
         'n_term_rmsd': '',
         'c_term_rmsd': '',
+        'ref_nme_ace_ca_distance': '',
+        'gen_nme_ace_ca_distance': '',
+        'nme_ace_ca_distance_deviation': '',
+        'nme_ace_ca_distance_abs_deviation': '',
         'error': '',
     }
     if WORKER_MERGE:
@@ -625,6 +709,13 @@ def process_sdf_path(sdf_path):
         row['rmsd'] = f'{terminal_rmsd:.6f}'
         row['n_term_rmsd'] = f'{rmsd(aligned[:5], WORKER_REF_COORDS[:5]):.6f}'
         row['c_term_rmsd'] = f'{rmsd(aligned[5:], WORKER_REF_COORDS[5:]):.6f}'
+        ref_ca_distance = pair_distance(WORKER_REF_COORDS, WORKER_REF_CA_DISTANCE_SLOTS)
+        gen_ca_distance = pair_distance(gen_coords, WORKER_GEN_CA_DISTANCE_SLOTS)
+        ca_distance_deviation = gen_ca_distance - ref_ca_distance
+        row['ref_nme_ace_ca_distance'] = f'{ref_ca_distance:.6f}'
+        row['gen_nme_ace_ca_distance'] = f'{gen_ca_distance:.6f}'
+        row['nme_ace_ca_distance_deviation'] = f'{ca_distance_deviation:.6f}'
+        row['nme_ace_ca_distance_abs_deviation'] = f'{abs(ca_distance_deviation):.6f}'
         if WORKER_MERGE:
             update_merge_row(row, sdf_path, mol, cur_indexes, terminal_rmsd)
     except Exception as exc:
@@ -694,6 +785,8 @@ def iter_result_rows(sdf_paths, args, ref_indexes, gen_indexes, merge_output_dir
         ref_indexes,
         str(args.input),
         gen_indexes,
+        args.ref_ca_distance_slots,
+        args.gen_ca_distance_slots,
         args.mol_index,
         args.merge,
         None if merge_output_dir is None else str(merge_output_dir),
@@ -720,6 +813,12 @@ def iter_result_rows(sdf_paths, args, ref_indexes, gen_indexes, merge_output_dir
 
 def main():
     args = parse_args()
+    args.ref_ca_distance_slots = validate_slot_pair(
+        args.ref_ca_distance_slots, '--ref-ca-distance-slots'
+    )
+    args.gen_ca_distance_slots = validate_slot_pair(
+        args.gen_ca_distance_slots, '--gen-ca-distance-slots'
+    )
     input_dir = Path(args.input)
     ref_mol = load_sdf_mol(args.ref, args.ref_mol_index)
     if args.index is None:

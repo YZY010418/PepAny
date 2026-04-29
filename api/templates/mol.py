@@ -24,7 +24,7 @@ class Molecule(BaseTemplate):
 
         return num_blocks
 
-    def set_control(self, data):
+    def set_control(self, data, cplx_desc=None):
         data['is_aa'][data['generate_mask']] = False
         data['position_ids'][data['generate_mask']] = 0
         if 'term_rel_pos' in data:

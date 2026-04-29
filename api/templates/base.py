@@ -21,6 +21,7 @@ class ComplexDesc:
     center_mask: List[int] = None
     generate_mask: List[int] = None
     topo_generate_mask: Optional[List[int]] = None
+    control: Optional[dict] = None
 
 
 @R.register('BaseTemplate')
@@ -88,7 +89,7 @@ class BaseTemplate:
     def validate(self, cplx_desc: ComplexDesc):
         return True
 
-    def set_control(self, data: dict):
+    def set_control(self, data: dict, cplx_desc: Optional[ComplexDesc]=None):
         return data
     
     def __call__(self, cplx_desc: ComplexDesc) -> ComplexDesc:

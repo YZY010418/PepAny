@@ -56,7 +56,7 @@ class PDBDataset(torch.utils.data.Dataset):
         if cplx_desc.topo_generate_mask is not None:
             data['topo_generate_mask'] = torch.tensor(cplx_desc.topo_generate_mask, dtype=torch.bool)
 
-        data = self.config.set_control(data)
+        data = self.config.set_control(data, cplx_desc=cplx_desc)
         data['cplx_desc'] = cplx_desc
 
         return data

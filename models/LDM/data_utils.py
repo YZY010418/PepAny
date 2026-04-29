@@ -251,16 +251,26 @@ def _get_item(pdb_path, sdf_path, tgt_chains):
 
 
 class Recorder:
-    def __init__(self, test_set, n_samples, save_dir):
+    def __init__(self, test_set, n_samples, save_dir, max_generated=None):
         self.pbar = tqdm(total=n_samples * len(test_set))
         self.waiting_list = [(i, n) for n in range(n_samples) for i in range(len(test_set))]
         self.num_generated, self.num_failed = 0, 0
+        self.max_generated = None if max_generated is None else int(max_generated)
         self.fout = open(os.path.join(save_dir, 'results.jsonl'), 'w')
 
     def is_finished(self):
-        return len(self.waiting_list) == 0
+        if len(self.waiting_list) == 0:
+            return True
+        if self.max_generated is None:
+            return False
+        return self.num_generated >= self.max_generated
 
     def get_next_batch_list(self, batch_size):
+        if self.max_generated is not None:
+            remaining = self.max_generated - self.num_generated
+            if remaining <= 0:
+                return []
+            batch_size = min(batch_size, remaining)
         batch_list = self.waiting_list[:batch_size]
         self.waiting_list = self.waiting_list[batch_size:]
         return batch_list
@@ -269,7 +279,8 @@ class Recorder:
         self.num_generated += 1
         if log is None:
             self.num_failed += 1
-            self.waiting_list.append((item_idx, n))
+            if self.max_generated is None or self.num_generated < self.max_generated:
+                self.waiting_list.append((item_idx, n))
         else:
             log.update({
                 'n': n,
