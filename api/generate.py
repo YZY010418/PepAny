@@ -195,6 +195,17 @@ def generate_for_one_template(model, dataset, n_samples, batch_size, save_dir, d
     shutil.rmtree(tmp_save_dir)
 
 
+def _template_run_name(template, template_idx, class_counts):
+    run_name = template.pop('name', None)
+    if run_name is not None:
+        return str(run_name)
+
+    class_name = template['class']
+    if class_counts[class_name] == 1:
+        return class_name
+    return f'{template_idx:02d}_{class_name}'
+
+
 def main(args, opt_args):
     config = yaml.safe_load(open(args.config, 'r'))
     config = overwrite_values(config, opt_args)
@@ -211,12 +222,23 @@ def main(args, opt_args):
     
     # load dataset and dataloader
     batch_size = config.get('batch_size', 32)
-    for template in config['templates']:
+    templates = config['templates']
+    class_counts = {}
+    for template in templates:
+        class_counts[template['class']] = class_counts.get(template['class'], 0) + 1
+
+    for template_idx, template in enumerate(templates):
+        template = dict(template)
+        n_samples = int(template.pop('n_samples', config.get('n_samples', 0)))
+        if n_samples <= 0:
+            raise ValueError('Set n_samples globally or inside each template to a positive integer')
+        run_name = _template_run_name(template, template_idx, class_counts)
         print_log(f'Generating for template: {template}')
-        out_dir = os.path.join(args.save_dir, template['class'], 'candidates')
+        print_log(f'Run name: {run_name}, n_samples: {n_samples}')
+        out_dir = os.path.join(args.save_dir, run_name, 'candidates')
         os.makedirs(out_dir, exist_ok=True)
         dataset = PDBDataset(**config['dataset'], template_config=R.construct(template))
-        generate_for_one_template(model, dataset, config['n_samples'], batch_size, out_dir, device, sample_opt)
+        generate_for_one_template(model, dataset, n_samples, batch_size, out_dir, device, sample_opt)
 
 
 if __name__ == '__main__':
