@@ -227,6 +227,7 @@ class LDMMolDesign(nn.Module):
             lengths,        # [batch_size]
             is_aa,          # [Nblock], 1 for amino acid (for determining the X_mask in inverse folding)
             term_rel_pos,   # [Nblock, 15], relative position to N-term and C-term
+            topo_generate_mask=None, # [Nblock], 1 for generated blocks with sampled topology, 0 for fixed topology
             sample_opt={
                 'pbar': False,
                 # 'energy_func': None,
@@ -240,8 +241,16 @@ class LDMMolDesign(nn.Module):
         guidance_scale = sample_opt.pop('guidance_scale', self.guidance_scale)
 
         block_ids = length_to_batch_id(block_lengths)
+        if topo_generate_mask is None:
+            topo_generate_mask = generate_mask
+
+        X_decode, S_decode, A_decode, bonds_decode = X, S, A, bonds
 
         # ensure there is no data leakage
+        X = X.clone()
+        S = S.clone()
+        A = A.clone()
+        bonds = bonds.clone()
         S[generate_mask] = 0
         X[generate_mask[block_ids]] = 0
         A[generate_mask[block_ids]] = 0
@@ -303,9 +312,9 @@ class LDMMolDesign(nn.Module):
 
         # autodecoder decode
         return self.autoencoder.generate(
-            X=X, S=S, A=A, bonds=bonds, position_ids=position_ids,
+            X=X, S=S_decode, A=A_decode, bonds=bonds_decode, position_ids=position_ids,
             chain_ids=chain_ids, generate_mask=generate_mask, block_lengths=block_lengths,
             lengths=lengths, is_aa=is_aa, given_latent=(H_0, X_0, None),
-            n_iter=vae_decode_n_iter, topo_generate_mask=generate_mask,
+            n_iter=vae_decode_n_iter, topo_generate_mask=topo_generate_mask,
             term_rel_pos=term_rel_pos, guidance_scale=guidance_scale
         )

@@ -678,29 +678,36 @@ class CondIterAutoEncoder(nn.Module):
             ctx_atom_order_map[bonds[:, 0]], ctx_atom_order_map[bonds[:, 1]], bonds[:, 2]
         ], dim=-1) # [E, 3]
 
-        # generate atoms/bonds based on predicted blocks
-        gen_A, gen_block_ids, gen_bonds = block_to_atom_map(pred_block_type[generate_mask], torch.nonzero(generate_mask).squeeze(-1))
-        # gen_block_ids is mononically increasing
-        # replace topo-fix atoms
+        # generate atoms/bonds based on predicted blocks. Topology-fixed generated
+        # blocks may be non-vocabulary caps, so preserve their input atoms directly.
+        gen_block_ids_all = torch.nonzero(generate_mask).squeeze(-1)
         topo_fix_mask = (~topo_generate_mask) & generate_mask
-        gen_A[topo_fix_mask[gen_block_ids]] = A[topo_fix_mask[block_ids]]
-        # extract topo-fix bonds
-        topo_fix_bonds = gt_bonds[topo_fix_mask[block_ids][gt_bonds[:, 0]] & topo_fix_mask[block_ids][gt_bonds[:, 1]]]
-        # from global index to local index
-        block_offsets = scatter_sum(torch.ones_like(block_ids), block_ids, dim=0).cumsum(dim=0) # [Nblock]
-        block_offsets = F.pad(block_offsets[:-1], pad=(1, 0), value=0) # [Nblock]
-        row_block_ids, col_block_ids = block_ids[topo_fix_bonds[:, 0]], block_ids[topo_fix_bonds[:, 1]]
-        topo_fix_bonds[:, 0] = topo_fix_bonds[:, 0] - block_offsets[row_block_ids]
-        topo_fix_bonds[:, 1] = topo_fix_bonds[:, 1] - block_offsets[col_block_ids]
-        # from local index to global index defined by the generated atoms
-        block_offsets = scatter_sum(torch.ones_like(gen_block_ids), gen_block_ids, dim=0).cumsum(dim=0) # [Nblock]
-        block_offsets = F.pad(block_offsets[:-1], pad=(1, 0), value=0) # [Nblock]
-        topo_fix_bonds[:, 0] = topo_fix_bonds[:, 0] + block_offsets[row_block_ids]
-        topo_fix_bonds[:, 1] = topo_fix_bonds[:, 1] + block_offsets[col_block_ids]
-        # delete the original bonds from block_to_atom_map
-        gen_bonds = gen_bonds[~topo_fix_mask[gen_block_ids][gen_bonds[:, 0]]] # since these bonds are only intra-block
-        # add the topo fix bonds
-        gen_bonds = torch.cat([gen_bonds, topo_fix_bonds], dim=0) # [E1+E2, 3]
+        free_gen_block_ids = gen_block_ids_all[topo_generate_mask[gen_block_ids_all]]
+        if free_gen_block_ids.numel() > 0:
+            gen_A, gen_block_ids, gen_bonds = block_to_atom_map(pred_block_type[free_gen_block_ids], free_gen_block_ids)
+        else:
+            gen_A = A.new_empty((0,))
+            gen_block_ids = block_ids.new_empty((0,))
+            gen_bonds = bonds.new_empty((0, 3))
+
+        fixed_atom_mask = topo_fix_mask[block_ids]
+        if fixed_atom_mask.any():
+            fixed_A = A[fixed_atom_mask]
+            fixed_block_ids = block_ids[fixed_atom_mask]
+            old_to_new = -torch.ones_like(block_ids, dtype=torch.long)
+            old_to_new[fixed_atom_mask] = torch.arange(
+                gen_A.shape[0],
+                gen_A.shape[0] + fixed_A.shape[0],
+                device=A.device
+            )
+            fixed_bond_mask = fixed_atom_mask[gt_bonds[:, 0]] & fixed_atom_mask[gt_bonds[:, 1]]
+            fixed_bonds = gt_bonds[fixed_bond_mask].clone()
+            if fixed_bonds.numel() > 0:
+                fixed_bonds[:, 0] = old_to_new[fixed_bonds[:, 0]]
+                fixed_bonds[:, 1] = old_to_new[fixed_bonds[:, 1]]
+            gen_A = torch.cat([gen_A, fixed_A], dim=0)
+            gen_block_ids = torch.cat([gen_block_ids, fixed_block_ids], dim=0)
+            gen_bonds = torch.cat([gen_bonds, fixed_bonds], dim=0)
         gen_X = Zx_mu[gen_block_ids] + torch.randn_like(Zx_mu[gen_block_ids]) * self.prior_coord_std
 
         # concat context and generated part

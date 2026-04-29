@@ -17,16 +17,17 @@ from .templates import BaseTemplate, ComplexDesc
 class PDBDataset(torch.utils.data.Dataset):
     def __init__(self, pdb_paths: List[str], tgt_chains: List[List[str]], lig_chains: List[List[str]], template_config: BaseTemplate, n_samples: int=1):
         super().__init__()
+        self.config = template_config
         self.pdb_paths = pdb_paths
         self.tgt_chains = tgt_chains
         self.lig_chains = lig_chains
         self.cplxs, self.pocket_block_ids = [], []
+        preserve_residue_names = getattr(self.config, 'preserve_residue_names', None)
         for path, tgt, lig in zip(pdb_paths, tgt_chains, lig_chains):
-            cplx, pocket_block_ids = self._process_pdb(path, tgt, lig)
+            cplx, pocket_block_ids = self._process_pdb(path, tgt, lig, preserve_residue_names=preserve_residue_names)
             self.cplxs.append(cplx)
             self.pocket_block_ids.append(pocket_block_ids)
         self.n_samples = n_samples
-        self.config = template_config
 
     def __getitem__(self, idx):
         idx = idx // self.n_samples
@@ -63,8 +64,12 @@ class PDBDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.cplxs) * self.n_samples
     
-    def _process_pdb(self, pdb_path, tgt_chains, lig_chains, pocket_dist_th=10.0):
-        cplx = pdb_to_complex(pdb_path, tgt_chains + lig_chains)
+    def _process_pdb(self, pdb_path, tgt_chains, lig_chains, pocket_dist_th=10.0, preserve_residue_names=None):
+        cplx = pdb_to_complex(
+            pdb_path,
+            tgt_chains + lig_chains,
+            preserve_residue_names=preserve_residue_names
+        )
         frag_lig_chains = []
         for mol in cplx:
             for c in lig_chains:

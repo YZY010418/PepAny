@@ -28,6 +28,7 @@ class BaseTemplate:
     def __init__(self, size_min=None, size_max=None):
         self.size_min = size_min
         self.size_max = size_max
+        self.preserve_residue_names = ()
 
     @property
     def name(self):

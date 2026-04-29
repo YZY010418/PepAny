@@ -44,7 +44,8 @@ def pdb_to_complex(
         selected_chains: Optional[List[str]]=None,
         remove_Hs: bool=True,
         remove_sol: bool=True,
-        remove_het: bool=False
+        remove_het: bool=False,
+        preserve_residue_names: Optional[List[str]]=None,
     ) -> Complex:
     '''
         Convert pdb file to Complex.
@@ -58,10 +59,13 @@ def pdb_to_complex(
             remove_Hs: Whether to remove all hydrogens
             remove_sol: Whether to remove all solvent molecules
             remove_het: Whether to remove all HETATM
+            preserve_residue_names: Non-standard residue names to keep as residue
+                blocks instead of fragmenting, e.g. ACE/NME peptide caps
 
         Returns:
                 A Complex instance
     '''
+    preserve_residue_names = set(str(name) for name in (preserve_residue_names or []))
 
     try:
         file = PDBFile.read(pdb_file)
@@ -177,6 +181,9 @@ def pdb_to_complex(
         if chain_id not in chain_residues:
             chain_residues[chain_id] = []
         if is_standard_aa(res_name):
+            chain_residues[chain_id].append(block)
+        elif res_name in preserve_residue_names:
+            block.properties['original_name'] = res_name
             chain_residues[chain_id].append(block)
         else: # fragmentation
             # get all bonds

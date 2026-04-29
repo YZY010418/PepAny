@@ -11,7 +11,7 @@ from tqdm import tqdm
 from rdkit import Chem
 
 from data.bioparse import Complex, Block, Atom, BondType, VOCAB
-from data.bioparse.utils import overwrite_block, is_standard_aa, index_to_numerical_index, bond_type_to_rdkit, bond_type_from_rdkit
+from data.bioparse.utils import overwrite_block, is_standard_aa, index_to_numerical_index, bond_type_to_rdkit, bond_type_from_rdkit, recur_index
 from data.bioparse.tokenizer.tokenize_3d import TOKENIZER
 from data.bioparse.hierarchy import remove_mols, add_dummy_mol, merge_cplx
 from data.bioparse.writer.complex_to_pdb import complex_to_pdb
@@ -72,11 +72,30 @@ class OverwriteTask:
         explicit_bonds, atom_idx_map, gen_mol, all_atom_coords = [], {}, Chem.RWMol(), []
         for i, index in enumerate(overwrite_indexes):
             block_S, block_X, block_A, block_ll, block_bonds = self.S[i], self.X[i], self.A[i], self.ll[i], self.intra_bonds[i]
-            block_name = 'UNK' if block_S is None else VOCAB.idx_to_abrv(block_S)
+            source_block = recur_index(cplx, index)
+            preserve_source_block = (
+                block_S == VOCAB.abrv_to_idx('UNK')
+                and source_block.name != 'UNK'
+                and not is_standard_aa(source_block.name)
+            )
+            if preserve_source_block:
+                block_name = source_block.name
+                source_atom_names = [
+                    atom.name for atom in source_block
+                    if atom.get_element() != 'H'
+                ]
+                block_properties = dict(source_block.properties)
+                block_properties.setdefault('original_name', block_name)
+            else:
+                block_name = 'UNK' if block_S is None else VOCAB.idx_to_abrv(block_S)
+                source_atom_names = []
+                block_properties = {}
             # construct a new block
             atoms, local2global = [], {}
             if block_bonds is None or is_standard_aa(block_name): # use canonical order
                 canonical_order = VOCAB.abrv_to_atoms(block_name)
+            elif preserve_source_block:
+                canonical_order = source_atom_names
             else:
                 canonical_order = []    # use the input order, which might be different from the canonical order
             for atom_order, (x, a, l) in enumerate(zip(block_X, block_A, block_ll)):
@@ -106,6 +125,7 @@ class OverwriteTask:
                 name=block_name,
                 atoms=atoms,
                 id=index[1],
+                properties=block_properties,
             ))
             # prepare intra-block bonds
             if block_bonds is None: block_bonds = VOCAB.abrv_to_bonds(block_name)

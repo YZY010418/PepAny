@@ -102,6 +102,60 @@ def compute_terminal_rel_pos(blocks):
         return _zero_term_rel_pos()
 
 
+def compute_terminal_rel_pos_from_sdf(
+        sdf_path,
+        n_term_atom_indices,
+        c_term_atom_indices,
+        index_base=0,
+        mol_index=0,
+    ):
+    """Compute the 15-d terminal condition from two ordered 5-atom groups in an SDF."""
+    from rdkit import Chem
+
+    if len(n_term_atom_indices) != 5 or len(c_term_atom_indices) != 5:
+        raise ValueError('n_term_atom_indices and c_term_atom_indices must each contain exactly 5 atoms')
+
+    supplier = Chem.SDMolSupplier(sdf_path, removeHs=False)
+    if supplier is None:
+        raise ValueError(f'Could not open SDF file: {sdf_path}')
+    mols = [mol for mol in supplier if mol is not None]
+    if not mols:
+        raise ValueError(f'No valid molecules found in SDF file: {sdf_path}')
+    if mol_index < 0 or mol_index >= len(mols):
+        raise ValueError(f'mol_index {mol_index} is out of range for {len(mols)} molecule(s) in {sdf_path}')
+
+    mol = mols[mol_index]
+    if mol.GetNumConformers() == 0:
+        raise ValueError(f'Molecule {mol_index} in {sdf_path} has no 3D conformer')
+    conf = mol.GetConformer()
+    num_atoms = mol.GetNumAtoms()
+
+    def get_points(atom_indices, label):
+        points = []
+        for raw_idx in atom_indices:
+            atom_idx = int(raw_idx) - int(index_base)
+            if atom_idx < 0 or atom_idx >= num_atoms:
+                raise ValueError(
+                    f'{label} atom index {raw_idx} with index_base={index_base} '
+                    f'maps to {atom_idx}, but molecule has {num_atoms} atoms'
+                )
+            pos = conf.GetAtomPosition(atom_idx)
+            points.append(np.array([pos.x, pos.y, pos.z], dtype=np.float32))
+        return points
+
+    n_term_descriptor = terminal_descriptor(*get_points(n_term_atom_indices, 'n_term_atom_indices'))
+    c_term_descriptor = terminal_descriptor(*get_points(c_term_atom_indices, 'c_term_atom_indices'))
+    term_rel_pos = _relative_term_feature(n_term_descriptor, c_term_descriptor).astype(np.float32)
+
+    if not np.isfinite(term_rel_pos).all():
+        raise ValueError(f'Computed term_rel_pos from {sdf_path} contains NaN or Inf')
+    if np.allclose(term_rel_pos, 0.0):
+        raise ValueError(
+            f'Computed term_rel_pos from {sdf_path} is all zeros; check atom order and 3D coordinates'
+        )
+    return term_rel_pos
+
+
 @R.register('PeptideDataset')
 class PeptideDataset(BaseDataset):
 
