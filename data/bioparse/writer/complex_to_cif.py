@@ -9,7 +9,7 @@ from ..vocab import VOCAB
 
 
 def _quote(value):
-    value = '?' if value is None or value == '' else str(value)
+    value = '.' if value is None or value == '' else str(value)
     if re.fullmatch(r'[A-Za-z0-9_.+-]+', value):
         return value
     return "'" + value.replace("'", "''") + "'"
@@ -59,7 +59,6 @@ def complex_to_cif(
         fout.write('_atom_site.Cartn_z\n')
         fout.write('_atom_site.occupancy\n')
         fout.write('_atom_site.B_iso_or_equiv\n')
-        fout.write('_atom_site.pdbx_formal_charge\n')
         fout.write('_atom_site.auth_seq_id\n')
         fout.write('_atom_site.auth_comp_id\n')
         fout.write('_atom_site.auth_asym_id\n')
@@ -77,7 +76,7 @@ def complex_to_cif(
                 block_name = _block_name(block)
                 group = 'ATOM' if block.name in const.AA_GEOMETRY else 'HETATM'
                 seq_id = int(block.id[0])
-                insert_code = str(block.id[1]).strip() or '?'
+                insert_code = str(block.id[1]).strip() or '.'
                 for atom_idx, atom in enumerate(block):
                     occupancy = atom.get_property('occupancy', 1.0)
                     bfactor = atom.get_property('bfactor', 0.0)
@@ -106,7 +105,6 @@ def complex_to_cif(
                         f'{float(z):.3f}',
                         f'{float(occupancy):.2f}',
                         f'{float(bfactor):.2f}',
-                        '?',
                         seq_id,
                         block_name,
                         mol.id,
@@ -117,17 +115,52 @@ def complex_to_cif(
                     atom_number += 1
         fout.write('#\n')
 
-        bond_rows = []
+        chem_bond_rows = []
+        struct_conn_rows = []
         for bond_idx, bond in enumerate(cplx.bonds, start=1):
             site1 = atom_sites.get(tuple(bond.index1))
             site2 = atom_sites.get(tuple(bond.index2))
             if site1 is None or site2 is None:
                 continue
+            same_block = bond.index1[:2] == bond.index2[:2]
+            if same_block and not site1['block_is_standard']:
+                chem_bond_rows.append((bond_idx, site1, site2, bond.bond_type))
+                continue
             if site1['block_is_standard'] and site2['block_is_standard']:
                 continue
-            bond_rows.append((bond_idx, site1, site2, bond.bond_type))
+            struct_conn_rows.append((bond_idx, site1, site2, bond.bond_type))
 
-        if bond_rows:
+        order_names = {
+            BondType.SINGLE: 'SING',
+            BondType.DOUBLE: 'DOUB',
+            BondType.TRIPLE: 'TRIP',
+            BondType.AROMATIC: 'AROM',
+        }
+
+        if chem_bond_rows:
+            fout.write('loop_\n')
+            fout.write('_chem_comp_bond.comp_id\n')
+            fout.write('_chem_comp_bond.atom_id_1\n')
+            fout.write('_chem_comp_bond.atom_id_2\n')
+            fout.write('_chem_comp_bond.value_order\n')
+            fout.write('_chem_comp_bond.pdbx_aromatic_flag\n')
+            fout.write('_chem_comp_bond.pdbx_stereo_config\n')
+            fout.write('_chem_comp_bond.pdbx_ordinal\n')
+
+            for ordinal, (_bond_idx, site1, site2, bond_type) in enumerate(chem_bond_rows, start=1):
+                row = [
+                    site1['block_name'],
+                    site1['atom_name'],
+                    site2['atom_name'],
+                    order_names.get(bond_type, 'SING'),
+                    'Y' if bond_type == BondType.AROMATIC else 'N',
+                    'N',
+                    ordinal,
+                ]
+                fout.write(' '.join(_quote(value) for value in row) + '\n')
+            fout.write('#\n')
+
+        if struct_conn_rows:
             fout.write('loop_\n')
             fout.write('_struct_conn.id\n')
             fout.write('_struct_conn.conn_type_id\n')
@@ -135,20 +168,22 @@ def complex_to_cif(
             fout.write('_struct_conn.ptnr1_label_comp_id\n')
             fout.write('_struct_conn.ptnr1_label_seq_id\n')
             fout.write('_struct_conn.ptnr1_label_atom_id\n')
+            fout.write('_struct_conn.ptnr1_auth_asym_id\n')
+            fout.write('_struct_conn.ptnr1_auth_comp_id\n')
+            fout.write('_struct_conn.ptnr1_auth_seq_id\n')
+            fout.write('_struct_conn.ptnr1_auth_atom_id\n')
             fout.write('_struct_conn.ptnr2_label_asym_id\n')
             fout.write('_struct_conn.ptnr2_label_comp_id\n')
             fout.write('_struct_conn.ptnr2_label_seq_id\n')
             fout.write('_struct_conn.ptnr2_label_atom_id\n')
+            fout.write('_struct_conn.ptnr2_auth_asym_id\n')
+            fout.write('_struct_conn.ptnr2_auth_comp_id\n')
+            fout.write('_struct_conn.ptnr2_auth_seq_id\n')
+            fout.write('_struct_conn.ptnr2_auth_atom_id\n')
             fout.write('_struct_conn.pdbx_value_order\n')
             fout.write('_struct_conn.pdbx_dist_value\n')
 
-            order_names = {
-                BondType.SINGLE: 'sing',
-                BondType.DOUBLE: 'doub',
-                BondType.TRIPLE: 'trip',
-                BondType.AROMATIC: 'arom',
-            }
-            for bond_idx, site1, site2, bond_type in bond_rows:
+            for bond_idx, site1, site2, bond_type in struct_conn_rows:
                 dist = sum(
                     (float(site1['coord'][i]) - float(site2['coord'][i])) ** 2
                     for i in range(3)
@@ -160,11 +195,19 @@ def complex_to_cif(
                     site1['block_name'],
                     site1['seq_id'],
                     site1['atom_name'],
+                    site1['chain'],
+                    site1['block_name'],
+                    site1['seq_id'],
+                    site1['atom_name'],
                     site2['chain'],
                     site2['block_name'],
                     site2['seq_id'],
                     site2['atom_name'],
-                    order_names.get(bond_type, '?'),
+                    site2['chain'],
+                    site2['block_name'],
+                    site2['seq_id'],
+                    site2['atom_name'],
+                    order_names.get(bond_type, 'SING'),
                     f'{dist:.3f}',
                 ]
                 fout.write(' '.join(_quote(value) for value in row) + '\n')

@@ -26,6 +26,9 @@ class TermRelPosSDFSampler:
         self.index_base = self.config.get('index_base', 0)
         self.mol_index = self.config.get('mol_index', 0)
         self._cache = {}
+        self._path_order = []
+        self._path_cursor = 0
+        self._last_path = None
 
     def _resolve_paths(self, sdf_path):
         path = Path(sdf_path)
@@ -69,8 +72,24 @@ class TermRelPosSDFSampler:
             )
         return self._cache[sdf_path]
 
+    def _next_path(self):
+        if len(self.paths) == 1:
+            return self.paths[0]
+
+        if self._path_cursor >= len(self._path_order):
+            self._path_order = list(self.paths)
+            np.random.shuffle(self._path_order)
+            if self._last_path is not None and self._path_order[0] == self._last_path:
+                self._path_order[0], self._path_order[1] = self._path_order[1], self._path_order[0]
+            self._path_cursor = 0
+
+        sdf_path = self._path_order[self._path_cursor]
+        self._path_cursor += 1
+        self._last_path = sdf_path
+        return sdf_path
+
     def sample(self):
-        sdf_path = str(np.random.choice(self.paths))
+        sdf_path = str(self._next_path())
         term_rel_pos = self._term_rel_pos(sdf_path)
         metadata = {
             'term_rel_pos_sdf_path': sdf_path,

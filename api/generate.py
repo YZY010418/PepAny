@@ -3,24 +3,30 @@
 import os
 import shutil
 import argparse
+import csv
+from copy import deepcopy
 from pathlib import Path
 
 import yaml
 import torch
 from rdkit import Chem
 
-from data.bioparse.hierarchy import Atom, Block, Bond, Complex, Molecule, merge_cplx, remove_mols
+from data.bioparse.hierarchy import Atom, Block, Bond, BondType, Complex, Molecule
 from data.bioparse.utils import bond_type_from_rdkit
 from data.bioparse.writer.complex_to_cif import complex_to_cif
 from data.bioparse.writer.complex_to_pdb import complex_to_pdb
 from evaluation.terminal_amide_rmsd import (
+    align_ref_to_generated,
     detect_clashes,
     detect_receptor_clashes,
     get_positions,
+    heavy_atom_mol_with_map,
     infer_generated_indexes,
     kabsch_align,
     load_sdf_mol,
     merge_terminal_cap,
+    remap_indexes,
+    remove_atoms_with_map,
     rmsd,
     write_sdf,
 )
@@ -144,49 +150,191 @@ def _atom_name(symbol, counts):
     return f'{symbol}{counts[symbol]}'
 
 
-def rdkit_mol_to_ligand_complex(mol, chain_id='L', residue_name='CYC'):
-    conf = mol.GetConformer()
-    atoms = []
-    name_counts = {}
-    for atom in mol.GetAtoms():
-        idx = atom.GetIdx()
-        pos = conf.GetAtomPosition(idx)
-        symbol = atom.GetSymbol()
-        atoms.append(Atom(
-            name=_atom_name(symbol, name_counts),
-            coordinate=[float(pos.x), float(pos.y), float(pos.z)],
-            element=symbol,
-            id=str(idx + 1),
-        ))
+def rdkit_atom_name(atom, counts):
+    monomer_info = atom.GetMonomerInfo()
+    if monomer_info is not None:
+        name = monomer_info.GetName().strip()
+        if name:
+            return name
+    if atom.HasProp('atom_name'):
+        name = atom.GetProp('atom_name').strip()
+        if name:
+            return name
+    return _atom_name(atom.GetSymbol(), counts)
 
-    block = Block(
-        name=str(residue_name)[:3],
-        atoms=atoms,
-        id=(1, ''),
-        properties={'original_name': str(residue_name)[:3]},
-    )
+
+def ligand_heavy_atom_refs(cplx, lig_chain):
+    refs = []
+    mol_idx = cplx.id2idx[lig_chain]
+    for block_idx, block in enumerate(cplx[lig_chain]):
+        for atom_idx, atom in enumerate(block):
+            if str(atom.element).upper() in {'H', 'D'}:
+                continue
+            refs.append((mol_idx, block_idx, atom_idx))
+    return refs
+
+
+def remove_ligand_blocks_and_append_cap(cplx, lig_chain, remove_block_idxs, cap_block, cap_bonds, link_bonds):
+    cplx = deepcopy(cplx)
+    lig_mol_idx = cplx.id2idx[lig_chain]
+    lig_mol = cplx[lig_chain]
+    remove_block_idxs = set(int(idx) for idx in remove_block_idxs)
+    cap_insert_idx = min(remove_block_idxs) if remove_block_idxs else len(lig_mol.blocks)
+
+    kept_blocks = []
+    block_old2new = {}
+    for old_idx, block in enumerate(lig_mol.blocks):
+        if old_idx == cap_insert_idx:
+            cap_block_idx = len(kept_blocks)
+            kept_blocks.append(cap_block)
+        if old_idx in remove_block_idxs:
+            continue
+        block_old2new[old_idx] = len(kept_blocks)
+        kept_blocks.append(block)
+
+    if cap_insert_idx >= len(lig_mol.blocks):
+        cap_block_idx = len(kept_blocks)
+        kept_blocks.append(cap_block)
+
+    molecules = []
+    for mol_idx, mol in enumerate(cplx):
+        if mol_idx == lig_mol_idx:
+            molecules.append(Molecule(
+                name=mol.name,
+                blocks=kept_blocks,
+                id=mol.id,
+                properties=mol.properties,
+            ))
+        else:
+            molecules.append(mol)
+
     bonds = []
-    for bond in mol.GetBonds():
+    for bond in cplx.bonds:
+        idx1 = tuple(bond.index1)
+        idx2 = tuple(bond.index2)
+        if idx1[0] == lig_mol_idx:
+            if idx1[1] in remove_block_idxs:
+                continue
+            idx1 = (idx1[0], block_old2new[idx1[1]], idx1[2])
+        if idx2[0] == lig_mol_idx:
+            if idx2[1] in remove_block_idxs:
+                continue
+            idx2 = (idx2[0], block_old2new[idx2[1]], idx2[2])
+        bonds.append(Bond(idx1, idx2, bond.bond_type))
+
+    for atom_idx1, atom_idx2, bond_type in cap_bonds:
         bonds.append(Bond(
-            index1=(0, 0, bond.GetBeginAtomIdx()),
-            index2=(0, 0, bond.GetEndAtomIdx()),
-            bond_type=bond_type_from_rdkit(bond),
+            index1=(lig_mol_idx, cap_block_idx, atom_idx1),
+            index2=(lig_mol_idx, cap_block_idx, atom_idx2),
+            bond_type=bond_type,
         ))
+
+    for gen_ref, cap_atom_idx, bond_type in link_bonds:
+        _mol_idx, block_idx, atom_idx = gen_ref
+        bonds.append(Bond(
+            index1=(lig_mol_idx, block_old2new[block_idx], atom_idx),
+            index2=(lig_mol_idx, cap_block_idx, cap_atom_idx),
+            bond_type=bond_type,
+        ))
+
     return Complex(
-        name='merged_ligand',
-        molecules=[Molecule(name=str(residue_name), blocks=[block], id=str(chain_id))],
+        name=cplx.name,
+        molecules=molecules,
         bonds=bonds,
+        properties=cplx.properties,
     )
 
 
-def merged_complex_from_mol(cplx_desc, merged_mol, residue_name='CYC'):
-    receptor_cplx = remove_mols(cplx_desc.cplx, cplx_desc.lig_chains)
-    ligand_cplx = rdkit_mol_to_ligand_complex(
-        merged_mol,
-        chain_id=cplx_desc.lig_chains[0],
-        residue_name=residue_name,
+def merged_complex_with_cap_residue(cplx_desc, ref_mol, ref_indexes, gen_mol, gen_indexes, residue_name='CAP'):
+    ref_mol, ref_old_to_new = heavy_atom_mol_with_map(ref_mol)
+    gen_mol, gen_old_to_new = heavy_atom_mol_with_map(gen_mol)
+    ref_indexes = remap_indexes(ref_indexes, ref_old_to_new, 'Reference')
+    gen_indexes = remap_indexes(gen_indexes, gen_old_to_new, 'Generated')
+
+    ref_to_gen_n = list(ref_indexes[:5])
+    ref_to_gen_c = list(ref_indexes[5:])
+    gen_n = list(gen_indexes[:5])
+    gen_c = list(gen_indexes[5:])
+
+    ref_work, gen_work = align_ref_to_generated(ref_mol, ref_indexes, gen_mol, gen_indexes)
+
+    cplx = deepcopy(cplx_desc.cplx)
+    lig_chain = cplx_desc.lig_chains[0]
+    gen_refs = ligand_heavy_atom_refs(cplx, lig_chain)
+    if len(gen_refs) != gen_work.GetNumAtoms():
+        raise ValueError(
+            f'Generated ligand atom count mismatch: complex has {len(gen_refs)} heavy atoms, '
+            f'SDF has {gen_work.GetNumAtoms()}'
+        )
+
+    gen_conf = gen_work.GetConformer()
+    for gen_idx, atom_ref in enumerate(gen_refs):
+        pos = gen_conf.GetAtomPosition(gen_idx)
+        cplx.get_atom(atom_ref).coordinate = [float(pos.x), float(pos.y), float(pos.z)]
+
+    gen_remove = set(gen_n[:3] + gen_c[3:])
+    ref_remove = set(ref_to_gen_n[3:] + ref_to_gen_c[:3])
+    remove_block_idxs = {gen_refs[gen_idx][1] for gen_idx in gen_remove}
+
+    ref_kept, ref_map = remove_atoms_with_map(ref_work, ref_remove)
+    ref_conf = ref_kept.GetConformer()
+    cap_name = str(residue_name)[:3]
+    link_ref_atom_names = {
+        ref_to_gen_n[1]: 'C',
+        ref_to_gen_c[3]: 'N',
+    }
+    reserved_link_names = set(link_ref_atom_names.values())
+    atom_counts = {}
+    used_atom_names = set()
+    cap_atoms = []
+    for old_ref_idx, new_ref_idx in sorted(ref_map.items(), key=lambda item: item[1]):
+        atom = ref_work.GetAtomWithIdx(old_ref_idx)
+        pos = ref_conf.GetAtomPosition(new_ref_idx)
+        if old_ref_idx in link_ref_atom_names:
+            atom_name = link_ref_atom_names[old_ref_idx]
+        else:
+            atom_name = rdkit_atom_name(atom, atom_counts)
+            if atom_name in reserved_link_names:
+                atom_name = _atom_name(atom.GetSymbol(), atom_counts)
+        while atom_name in used_atom_names:
+            atom_name = _atom_name(atom.GetSymbol(), atom_counts)
+        used_atom_names.add(atom_name)
+        cap_atoms.append(Atom(
+            name=atom_name,
+            coordinate=[float(pos.x), float(pos.y), float(pos.z)],
+            element=atom.GetSymbol(),
+            id=str(new_ref_idx + 1),
+        ))
+
+    lig_mol = cplx[lig_chain]
+    cap_res_id = lig_mol.blocks[min(remove_block_idxs)].id if remove_block_idxs else (1, '')
+    cap_block = Block(
+        name=cap_name,
+        atoms=cap_atoms,
+        id=cap_res_id,
+        properties={'original_name': cap_name},
     )
-    return merge_cplx(receptor_cplx, ligand_cplx)
+
+    cap_bonds = []
+    for bond in ref_kept.GetBonds():
+        cap_bonds.append((
+            bond.GetBeginAtomIdx(),
+            bond.GetEndAtomIdx(),
+            bond_type_from_rdkit(bond),
+        ))
+
+    link_bonds = [
+        (gen_refs[gen_n[3]], ref_map[ref_to_gen_n[1]], BondType.SINGLE),
+        (gen_refs[gen_c[1]], ref_map[ref_to_gen_c[3]], BondType.SINGLE),
+    ]
+    return remove_ligand_blocks_and_append_cap(
+        cplx,
+        lig_chain,
+        remove_block_idxs,
+        cap_block,
+        cap_bonds,
+        link_bonds,
+    )
 
 
 def receptor_atoms_from_cplx(cplx, chain_ids):
@@ -212,13 +360,101 @@ def _pipeline_reject(reason, cplx_desc, n):
     return None
 
 
-def run_terminal_merge_pipeline(cplx_desc, details, n, raw_pdb_path, raw_sdf_path, accepted_dir, pipeline_opt):
+def compute_terminal_rmsd_details(cplx_desc, raw_sdf_path, pipeline_opt):
     control = cplx_desc.control or {}
     ref_path = control.get('term_rel_pos_sdf_path', None)
     ref_atom_indices = control.get('term_rel_pos_atom_indices', None)
     if ref_path is None or ref_atom_indices is None:
+        return {}
+
+    ref_indexes = _zero_based_indexes(
+        ref_atom_indices,
+        control.get('term_rel_pos_index_base', 0),
+    )
+    ref_mol = load_sdf_mol(ref_path, control.get('term_rel_pos_mol_index', 0))
+    gen_mol = load_sdf_mol(
+        raw_sdf_path,
+        int(_get_first(pipeline_opt, ('mol_index', 'gen_mol_index'), 0)),
+    )
+    gen_atom_indices = control.get('gen_atom_indices', pipeline_opt.get('gen_atom_indices', None))
+    if gen_atom_indices is None:
+        gen_indexes = infer_generated_indexes(gen_mol)
+    else:
+        gen_indexes = _zero_based_indexes(
+            gen_atom_indices,
+            control.get('gen_index_base', pipeline_opt.get('gen_index_base', 0)),
+        )
+
+    ref_coords = get_positions(ref_mol, ref_indexes)
+    gen_coords = get_positions(gen_mol, gen_indexes)
+    aligned = kabsch_align(gen_coords, ref_coords)
+    terminal_rmsd = rmsd(aligned, ref_coords)
+    return {
+        'rmsd': terminal_rmsd,
+        'terminal_rmsd': terminal_rmsd,
+        'n_term_rmsd': rmsd(aligned[:5], ref_coords[:5]),
+        'c_term_rmsd': rmsd(aligned[5:], ref_coords[5:]),
+        'reference_sdf': str(ref_path),
+        'conformer': _sdf_stem(ref_path),
+    }
+
+
+def add_terminal_rmsd_details(cplx_desc, details, raw_sdf_path, pipeline_opt):
+    try:
+        details.update(compute_terminal_rmsd_details(cplx_desc, raw_sdf_path, pipeline_opt))
+    except Exception as exc:
+        details['rmsd_error'] = str(exc)
+    return details
+
+
+PIPELINE_METADATA_FIELDS = [
+    'accepted_name',
+    'accepted_cif',
+    'id',
+    'sample_slot',
+    'conformer',
+    'rmsd',
+    'reference_sdf',
+    'terminal_rmsd',
+    'n_term_rmsd',
+    'c_term_rmsd',
+    'rmsd_cutoff',
+    'self_clash_count',
+    'receptor_clash_count',
+    'raw_pdb',
+    'raw_sdf',
+    'gen_seq',
+    'smiles',
+]
+
+
+def append_pipeline_metadata(accepted_dir, row):
+    path = Path(accepted_dir) / 'metadata.csv'
+    write_header = not path.exists()
+    with path.open('a', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=PIPELINE_METADATA_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, '') for field in PIPELINE_METADATA_FIELDS})
+
+
+def run_terminal_merge_pipeline(
+        cplx_desc,
+        details,
+        n,
+        raw_pdb_path,
+        raw_sdf_path,
+        accepted_dir,
+        pipeline_opt,
+        accepted_index,
+    ):
+    control = cplx_desc.control or {}
+    rmsd_details = compute_terminal_rmsd_details(cplx_desc, raw_sdf_path, pipeline_opt)
+    ref_path = rmsd_details.get('reference_sdf', None)
+    if ref_path is None:
         raise ValueError('pipeline.enabled requires term_rel_pos_sdf so each sample has a reference SDF')
 
+    ref_atom_indices = control.get('term_rel_pos_atom_indices', None)
     ref_index_base = control.get('term_rel_pos_index_base', 0)
     ref_mol_index = control.get('term_rel_pos_mol_index', 0)
     gen_mol_index = int(_get_first(pipeline_opt, ('mol_index', 'gen_mol_index'), 0))
@@ -260,37 +496,47 @@ def run_terminal_merge_pipeline(cplx_desc, details, n, raw_pdb_path, raw_sdf_pat
                 n,
             )
 
-    residue_name = pipeline_opt.get('ligand_residue_name', 'CYC')
-    accepted_subdir = Path(accepted_dir) / cplx_desc.id
-    accepted_subdir.mkdir(parents=True, exist_ok=True)
-    ref_stem = _sdf_stem(ref_path)
-    cif_path = accepted_subdir / f'{n}_{ref_stem}.cif'
-    merged_cplx = merged_complex_from_mol(cplx_desc, merged_mol, residue_name=residue_name)
+    residue_name = pipeline_opt.get('ligand_residue_name', 'CAP')
+    accepted_dir = Path(accepted_dir)
+    accepted_dir.mkdir(parents=True, exist_ok=True)
+    accepted_name = f'accepted_{accepted_index}'
+    cif_path = accepted_dir / f'{accepted_name}.cif'
+    merged_cplx = merged_complex_with_cap_residue(
+        cplx_desc,
+        ref_mol,
+        ref_indexes,
+        gen_mol,
+        gen_indexes,
+        residue_name=residue_name,
+    )
     complex_to_cif(
         merged_cplx,
         str(cif_path),
         selected_chains=cplx_desc.tgt_chains + cplx_desc.lig_chains,
-        title=f'{cplx_desc.id}_{n}_{ref_stem}',
+        title=accepted_name,
     )
 
     merged_sdf_path = ''
     if bool(pipeline_opt.get('write_merged_sdf', False)):
-        merged_sdf_path = str(accepted_subdir / f'{n}_{ref_stem}.sdf')
+        merged_sdf_path = str(accepted_dir / f'{accepted_name}.sdf')
         write_sdf(merged_mol, merged_sdf_path)
 
     details.update({
-        'terminal_rmsd': terminal_rmsd,
-        'n_term_rmsd': n_term_rmsd,
-        'c_term_rmsd': c_term_rmsd,
+        'accepted_name': accepted_name,
+        **rmsd_details,
         'rmsd_cutoff': rmsd_cutoff,
         'self_clash_count': len(self_clashes),
         'receptor_clash_count': len(receptor_clashes),
-        'reference_sdf': str(ref_path),
         'raw_pdb': str(raw_pdb_path),
         'raw_sdf': str(raw_sdf_path),
         'accepted_cif': str(cif_path),
         'merged_sdf': merged_sdf_path,
         'merge_status': 'saved',
+    })
+    append_pipeline_metadata(accepted_dir, {
+        **details,
+        'id': cplx_desc.id,
+        'sample_slot': n,
     })
     return details
 
@@ -317,6 +563,7 @@ def generate_for_one_template(
     if _option_enabled(pipeline_opt):
         os.makedirs(accepted_dir, exist_ok=True)
     recorder = Recorder(dataset, n_samples, save_dir, max_generated=max_sampling)
+    accepted_count = 0
     tmp_save_dir = os.path.join(save_dir, 'tmp')
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
     
@@ -364,9 +611,19 @@ def generate_for_one_template(
                             out_path.rstrip('.pdb') + '.sdf',
                             accepted_dir,
                             pipeline_opt,
+                            accepted_count + 1,
                         )
                     except Exception as exc:
                         details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
+                    if details is not None:
+                        accepted_count += 1
+                elif n_cycles == 0:
+                    details = add_terminal_rmsd_details(
+                        cplx_desc,
+                        details,
+                        out_path.rstrip('.pdb') + '.sdf',
+                        pipeline_opt,
+                    )
                 log = None if details is None else format_log(cplx_desc, details, n)
             
             if n_cycles == 0: recorder.check_and_save(log, item_idx, n)
@@ -418,9 +675,19 @@ def generate_for_one_template(
                                 out_path.rstrip('.pdb') + '.sdf',
                                 accepted_dir,
                                 pipeline_opt,
+                                accepted_count + 1,
                             )
                         except Exception as exc:
                             details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
+                        if details is not None:
+                            accepted_count += 1
+                    elif final_cycle:
+                        details = add_terminal_rmsd_details(
+                            cplx_desc,
+                            details,
+                            out_path.rstrip('.pdb') + '.sdf',
+                            pipeline_opt,
+                        )
                     log = None if details is None else format_log(cplx_desc, details, n)
 
                 if final_cycle: recorder.check_and_save(log, item_idx, n)

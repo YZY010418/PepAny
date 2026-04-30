@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
+import inspect
 import os
 from typing import List
 
@@ -12,6 +13,13 @@ from data.base import transform_data
 from data.peptide import compute_terminal_rel_pos
 
 from .templates import BaseTemplate, ComplexDesc
+
+
+def _pdb_to_complex_supports_preserve_residue_names():
+    try:
+        return 'preserve_residue_names' in inspect.signature(pdb_to_complex).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 class PDBDataset(torch.utils.data.Dataset):
@@ -65,11 +73,16 @@ class PDBDataset(torch.utils.data.Dataset):
         return len(self.cplxs) * self.n_samples
     
     def _process_pdb(self, pdb_path, tgt_chains, lig_chains, pocket_dist_th=10.0, preserve_residue_names=None):
-        cplx = pdb_to_complex(
-            pdb_path,
-            tgt_chains + lig_chains,
-            preserve_residue_names=preserve_residue_names
-        )
+        kwargs = {}
+        if preserve_residue_names:
+            if not _pdb_to_complex_supports_preserve_residue_names():
+                raise TypeError(
+                    'This pdb_to_complex() does not support preserve_residue_names; '
+                    'update data/bioparse/parser/pdb_to_complex.py or use a template '
+                    'that does not require preserved ligand residues.'
+                )
+            kwargs['preserve_residue_names'] = preserve_residue_names
+        cplx = pdb_to_complex(pdb_path, tgt_chains + lig_chains, **kwargs)
         frag_lig_chains = []
         for mol in cplx:
             for c in lig_chains:
