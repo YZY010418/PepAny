@@ -25,10 +25,27 @@ class TermRelPosSDFSampler:
         self.n_term_atom_indices, self.c_term_atom_indices = self._resolve_atom_indices()
         self.index_base = self.config.get('index_base', 0)
         self.mol_index = self.config.get('mol_index', 0)
+        self.sample_with_replacement = self._resolve_sample_with_replacement()
         self._cache = {}
         self._path_order = []
         self._path_cursor = 0
         self._last_path = None
+
+    def _resolve_sample_with_replacement(self):
+        mode = self.config.get('sampling_mode', self.config.get('sample_mode', None))
+        if mode is not None:
+            mode = str(mode).lower()
+            if mode in {'with_replacement', 'allow_reuse', 'reuse', 'random', 'replacement'}:
+                return True
+            if mode in {'without_replacement', 'no_reuse', 'shuffle', 'shuffled_epoch'}:
+                return False
+            raise ValueError(
+                'term_rel_pos_sdf sampling_mode must be one of '
+                'with_replacement/allow_reuse or without_replacement/no_reuse'
+            )
+        if 'sample_without_replacement' in self.config:
+            return not bool(self.config['sample_without_replacement'])
+        return bool(self.config.get('sample_with_replacement', True))
 
     def _resolve_paths(self, sdf_path):
         path = Path(sdf_path)
@@ -75,6 +92,11 @@ class TermRelPosSDFSampler:
     def _next_path(self):
         if len(self.paths) == 1:
             return self.paths[0]
+
+        if self.sample_with_replacement:
+            sdf_path = str(np.random.choice(self.paths))
+            self._last_path = sdf_path
+            return sdf_path
 
         if self._path_cursor >= len(self._path_order):
             self._path_order = list(self.paths)

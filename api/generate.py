@@ -5,6 +5,10 @@ import shutil
 import argparse
 import csv
 import re
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 from copy import deepcopy
 from pathlib import Path
 
@@ -13,6 +17,7 @@ import torch
 from rdkit import Chem
 
 from data.bioparse.hierarchy import Atom, Block, Bond, BondType, Complex, Molecule
+from data.bioparse.parser.cif_to_complex import cif_to_complex
 from data.bioparse.utils import bond_type_from_rdkit
 from data.bioparse.writer.complex_to_cif import complex_to_cif
 from data.bioparse.writer.complex_to_pdb import complex_to_pdb
@@ -49,6 +54,9 @@ def parse():
     parser.add_argument('--save_dir', type=str, required=True, help='Directory to save generated peptides')
 
     parser.add_argument('--gpu', type=int, default=0, help='GPU to use, -1 for cpu')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed, overrides config seed')
+    parser.add_argument('--num_shards', '--total_gpus', dest='num_shards', type=int, default=None, help='Total number of generation shards')
+    parser.add_argument('--shard_id', '--worker_id', dest='shard_id', type=int, default=None, help='Index of this generation shard, from 0 to num_shards - 1')
     parser.add_argument('--n_cpus', type=int, default=4, help='Number of CPU to use (for parallelly saving the generated results)')
     return parser.parse_known_args()
 
@@ -356,6 +364,74 @@ def _zero_based_indexes(indexes, index_base):
     return [int(index) - int(index_base) for index in indexes]
 
 
+def _coord_distance(coord1, coord2):
+    return sum((float(coord1[i]) - float(coord2[i])) ** 2 for i in range(3)) ** 0.5
+
+
+def _atom_by_name(block, atom_name):
+    atom_name = str(atom_name).strip()
+    for atom in block:
+        if str(atom.name).strip() == atom_name:
+            return atom
+    return None
+
+
+def _format_ligand_amide_violation(violation):
+    return (
+        f'{violation["chain"]}:{violation["prev_block"]}->{violation["next_block"]} '
+        f'C-N={violation["distance"]:.3f}A'
+    )
+
+
+def find_ligand_amide_bond_violations(cplx, lig_chains, max_distance):
+    violations = []
+    max_distance = float(max_distance)
+    for lig_chain in lig_chains:
+        if lig_chain not in cplx.id2idx:
+            continue
+        blocks = list(cplx[lig_chain])
+        for prev_block, next_block in zip(blocks[:-1], blocks[1:]):
+            c_atom = _atom_by_name(prev_block, 'C')
+            n_atom = _atom_by_name(next_block, 'N')
+            if c_atom is None or n_atom is None:
+                continue
+            distance = _coord_distance(c_atom.coordinate, n_atom.coordinate)
+            if distance > max_distance:
+                violations.append({
+                    'chain': lig_chain,
+                    'prev_block': f'{prev_block.name}{prev_block.id}',
+                    'next_block': f'{next_block.name}{next_block.id}',
+                    'distance': distance,
+                    'max_distance': max_distance,
+                })
+    return violations
+
+
+def _merge_amide_check_options(config, template):
+    opt = dict(config.get('amide_bond_check', {}) or {})
+    opt.update(dict(template.pop('amide_bond_check', {}) or {}))
+    opt.setdefault('enabled', True)
+    opt.setdefault('max_c_n_distance', opt.get('max_distance', 1.8))
+    return opt
+
+
+def _amide_check_enabled(amide_check_opt):
+    return bool(amide_check_opt.get('enabled', True))
+
+
+def reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt):
+    if details is None or not _amide_check_enabled(amide_check_opt):
+        return details
+    max_distance = float(amide_check_opt.get('max_c_n_distance', amide_check_opt.get('max_distance', 1.8)))
+    violations = find_ligand_amide_bond_violations(cplx_desc.cplx, cplx_desc.lig_chains, max_distance)
+    if not violations:
+        return details
+    joined = '; '.join(_format_ligand_amide_violation(item) for item in violations[:3])
+    if len(violations) > 3:
+        joined += f'; +{len(violations) - 3} more'
+    return _pipeline_reject(f'implausible ligand amide bond(s): {joined}', cplx_desc, n)
+
+
 def _pipeline_reject(reason, cplx_desc, n):
     print_log(f'Rejected {cplx_desc.id}/{n}: {reason}', level='DEBUG')
     return None
@@ -431,12 +507,18 @@ PIPELINE_METADATA_FIELDS = [
 
 def append_pipeline_metadata(accepted_dir, row):
     path = Path(accepted_dir) / 'metadata.csv'
-    write_header = not path.exists()
-    with path.open('a', newline='') as handle:
+    with path.open('a+', newline='') as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0, os.SEEK_END)
+        write_header = handle.tell() == 0
         writer = csv.DictWriter(handle, fieldnames=PIPELINE_METADATA_FIELDS)
         if write_header:
             writer.writeheader()
         writer.writerow({field: row.get(field, '') for field in PIPELINE_METADATA_FIELDS})
+        handle.flush()
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def resolve_pipeline_accepted_dir(save_dir, pipeline_opt):
@@ -548,6 +630,39 @@ def _resume_options(config, pipeline_opt):
     return options
 
 
+def _sanitize_options(config, pipeline_opt, amide_check_opt):
+    options = {}
+    for key in ('sanitize_generation', 'santinize_generation', 'sanitize', 'santinize'):
+        for source in (config, pipeline_opt):
+            if key not in source:
+                continue
+            raw = source[key]
+            if isinstance(raw, dict):
+                options.update(raw)
+            else:
+                options['enabled'] = bool(raw)
+    options['enabled'] = bool(options.get('enabled', False))
+    options.setdefault(
+        'max_c_n_distance',
+        amide_check_opt.get('max_c_n_distance', amide_check_opt.get('max_distance', 1.8)),
+    )
+    return options
+
+
+def _resume_previous_dir(resume_opt, save_root):
+    previous_dir = _get_first(
+        resume_opt,
+        ('previous_dir', 'resume_dir', 'resume_from', 'path', 'dir'),
+        None,
+    )
+    if previous_dir is None:
+        previous_dir = save_root
+    previous_root = Path(previous_dir)
+    if not previous_root.exists():
+        raise ValueError(f'resume_generation previous_dir does not exist: {previous_dir}')
+    return previous_root
+
+
 def _resume_accepted_dir(previous_dir, run_name, pipeline_opt):
     root = Path(previous_dir)
     output_dir = _pipeline_output_dir_name(pipeline_opt)
@@ -564,6 +679,15 @@ def _resume_accepted_dir(previous_dir, run_name, pipeline_opt):
         if (candidate / 'metadata.csv').exists() or any(candidate.glob('accepted_*.cif')):
             return candidate
     return candidates[0]
+
+
+def _dataset_lig_chain_ids(dataset):
+    lig_chain_ids = []
+    for chain_spec in dataset.lig_chains:
+        for chain_id in chain_spec:
+            if chain_id not in lig_chain_ids:
+                lig_chain_ids.append(chain_id)
+    return lig_chain_ids
 
 
 def _dataset_item_target_ids(dataset):
@@ -587,16 +711,7 @@ def build_pipeline_resume_state(
     if not resume_opt.get('enabled', False):
         return None
 
-    previous_dir = _get_first(
-        resume_opt,
-        ('previous_dir', 'resume_dir', 'resume_from', 'path', 'dir'),
-        None,
-    )
-    if previous_dir is None:
-        previous_dir = save_root
-    previous_root = Path(previous_dir)
-    if not previous_root.exists():
-        raise ValueError(f'resume_generation previous_dir does not exist: {previous_dir}')
+    previous_root = _resume_previous_dir(resume_opt, save_root)
 
     target_ids = _dataset_item_target_ids(dataset)
     accepted_dir = _resume_accepted_dir(previous_root, run_name, pipeline_opt)
@@ -643,6 +758,269 @@ def build_pipeline_resume_state(
         'remaining': total_remaining,
         'previous_accepted_dir': str(accepted_dir),
     }
+
+
+def _resolve_metadata_cif_path(row, accepted_dir):
+    accepted_dir = Path(accepted_dir)
+    candidates = []
+    accepted_cif = row.get('accepted_cif', '')
+    if accepted_cif:
+        accepted_cif_path = Path(accepted_cif)
+        candidates.append(accepted_dir / accepted_cif_path.name)
+        if not accepted_cif_path.is_absolute():
+            candidates.append(accepted_dir / accepted_cif_path)
+        else:
+            candidates.append(accepted_cif_path)
+    accepted_name = row.get('accepted_name', '')
+    if accepted_name:
+        candidates.append(accepted_dir / f'{accepted_name}.cif')
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _accepted_metadata_entries(accepted_dir):
+    accepted_dir = Path(accepted_dir)
+    entries = []
+    seen_paths = set()
+    for row in _read_pipeline_metadata(accepted_dir):
+        cif_path = _resolve_metadata_cif_path(row, accepted_dir)
+        if cif_path is None:
+            entries.append({'row': row, 'cif_path': None})
+            continue
+        cif_path = cif_path.resolve()
+        seen_paths.add(cif_path)
+        entries.append({'row': row, 'cif_path': cif_path})
+
+    for cif_path in accepted_dir.glob('accepted_*.cif'):
+        resolved = cif_path.resolve()
+        if resolved in seen_paths:
+            continue
+        entries.append({
+            'row': {
+                'accepted_name': cif_path.stem,
+                'accepted_cif': str(cif_path),
+            },
+            'cif_path': resolved,
+        })
+
+    def sort_key(entry):
+        row = entry['row']
+        name = row.get('accepted_name', '')
+        if not name and entry['cif_path'] is not None:
+            name = entry['cif_path'].stem
+        index = _accepted_index(name)
+        return (index is None, index if index is not None else name)
+
+    return sorted(entries, key=sort_key)
+
+
+def _write_pipeline_metadata(accepted_dir, rows):
+    path = Path(accepted_dir) / 'metadata.csv'
+    with path.open('w', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=PIPELINE_METADATA_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, '') for field in PIPELINE_METADATA_FIELDS})
+
+
+def _sanitize_lock_path(accepted_dir):
+    return Path(accepted_dir) / '.sanitize_generation.lock'
+
+
+def sanitize_pipeline_accepted_dir(accepted_dir, lig_chains, sanitize_opt):
+    accepted_dir = Path(accepted_dir)
+    if not accepted_dir.exists():
+        print_log(f'Sanitize generation: accepted dir does not exist, skipping {accepted_dir}', level='INFO')
+        return {'kept': 0, 'removed': 0}
+
+    lock_path = _sanitize_lock_path(accepted_dir)
+    lock_path.touch(exist_ok=True)
+    lock_handle = lock_path.open('r+')
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        return _sanitize_pipeline_accepted_dir_unlocked(accepted_dir, lig_chains, sanitize_opt)
+    finally:
+        if fcntl is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def _sanitize_pipeline_accepted_dir_unlocked(accepted_dir, lig_chains, sanitize_opt):
+    max_distance = float(sanitize_opt.get('max_c_n_distance', sanitize_opt.get('max_distance', 1.8)))
+    entries = _accepted_metadata_entries(accepted_dir)
+    kept = []
+    removed = []
+
+    for entry in entries:
+        row = dict(entry['row'])
+        cif_path = entry['cif_path']
+        if cif_path is None or not Path(cif_path).exists():
+            removed.append((cif_path, 'missing cif file'))
+            continue
+        try:
+            cplx = cif_to_complex(str(cif_path), selected_chains=lig_chains)
+            violations = find_ligand_amide_bond_violations(cplx, lig_chains, max_distance)
+        except Exception as exc:
+            violations = [{'error': str(exc)}]
+        if violations:
+            if 'error' in violations[0]:
+                reason = f'parse/check error: {violations[0]["error"]}'
+            else:
+                reason = '; '.join(_format_ligand_amide_violation(item) for item in violations[:3])
+            removed.append((Path(cif_path), reason))
+            continue
+        kept.append({'row': row, 'cif_path': Path(cif_path)})
+
+    for cif_path, reason in removed:
+        if cif_path is None:
+            print_log(f'Sanitize generation: dropped metadata row with missing CIF ({reason})', level='INFO')
+            continue
+        print_log(f'Sanitize generation: removing {cif_path.name}: {reason}', level='INFO')
+        if cif_path.exists():
+            cif_path.unlink()
+        sdf_path = cif_path.with_suffix('.sdf')
+        if sdf_path.exists():
+            sdf_path.unlink()
+
+    temp_entries = []
+    for entry in kept:
+        old_cif = entry['cif_path']
+        temp_cif = accepted_dir / f'.sanitize_tmp_{old_cif.name}'
+        if temp_cif.exists():
+            temp_cif.unlink()
+        shutil.move(str(old_cif), str(temp_cif))
+        old_sdf = old_cif.with_suffix('.sdf')
+        temp_sdf = None
+        if old_sdf.exists():
+            temp_sdf = accepted_dir / f'.sanitize_tmp_{old_sdf.name}'
+            if temp_sdf.exists():
+                temp_sdf.unlink()
+            shutil.move(str(old_sdf), str(temp_sdf))
+        temp_entries.append({
+            'row': entry['row'],
+            'temp_cif': temp_cif,
+            'temp_sdf': temp_sdf,
+        })
+
+    metadata_rows = []
+    for new_index, entry in enumerate(temp_entries, start=1):
+        accepted_name = f'accepted_{new_index}'
+        new_cif = accepted_dir / f'{accepted_name}.cif'
+        shutil.move(str(entry['temp_cif']), str(new_cif))
+        if entry['temp_sdf'] is not None:
+            shutil.move(str(entry['temp_sdf']), str(accepted_dir / f'{accepted_name}.sdf'))
+        row = dict(entry['row'])
+        row['accepted_name'] = accepted_name
+        row['accepted_cif'] = str(new_cif)
+        metadata_rows.append(row)
+
+    _write_pipeline_metadata(accepted_dir, metadata_rows)
+    print_log(
+        f'Sanitize generation: kept={len(metadata_rows)}, removed={len(removed)}, '
+        f'accepted_dir={accepted_dir}',
+        level='INFO',
+    )
+    return {'kept': len(metadata_rows), 'removed': len(removed)}
+
+
+def _resolve_split_options(config, args):
+    split_opt = dict(config.get('task_split', config.get('generation_split', {})) or {})
+    total = _get_first(split_opt, ('total', 'total_gpus', 'num_shards', 'world_size'), 1)
+    index = _get_first(split_opt, ('index', 'gpu_id', 'shard_id', 'rank'), 0)
+    if args.num_shards is not None:
+        total = args.num_shards
+    if args.shard_id is not None:
+        index = args.shard_id
+
+    total = int(total)
+    index = int(index)
+    enabled = bool(split_opt.get('enabled', False)) or total > 1
+    if not enabled:
+        total, index = 1, 0
+    if total <= 0:
+        raise ValueError('task_split.total/--num_shards must be a positive integer')
+    if index < 0 or index >= total:
+        raise ValueError(f'task_split.index/--shard_id must be in [0, {total - 1}], got {index}')
+    return {
+        'enabled': total > 1,
+        'total': total,
+        'index': index,
+    }
+
+
+def _default_generation_state(dataset, n_samples):
+    return {
+        'accepted_start_index': 1,
+        'append_results': False,
+        'goal_by_item': [n_samples for _ in range(len(dataset))],
+        'successes_by_item': [0 for _ in range(len(dataset))],
+        'waiting_list': [
+            (item_idx, n)
+            for n in range(n_samples)
+            for item_idx in range(len(dataset))
+        ],
+        'next_sample_index_by_item': [n_samples for _ in range(len(dataset))],
+        'start_successes': 0,
+        'remaining': n_samples * len(dataset),
+    }
+
+
+def apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name):
+    if not split_opt.get('enabled', False):
+        return resume_state
+
+    total = split_opt['total']
+    index = split_opt['index']
+    state = _default_generation_state(dataset, n_samples) if resume_state is None else dict(resume_state)
+    original_waiting_list = list(state.get('waiting_list', []))
+    sharded_waiting_list = [
+        slot
+        for pos, slot in enumerate(original_waiting_list)
+        if pos % total == index
+    ]
+    assigned_by_item = [0 for _ in range(len(dataset))]
+    for item_idx, _ in sharded_waiting_list:
+        assigned_by_item[item_idx] += 1
+
+    base_next_sample_index = state.get(
+        'next_sample_index_by_item',
+        [n_samples for _ in range(len(dataset))],
+    )
+    state.update({
+        'accepted_start_index': int(state.get('accepted_start_index', 1)) + index,
+        'accepted_index_stride': total,
+        'append_results': state.get('append_results', False),
+        'goal_by_item': assigned_by_item,
+        'successes_by_item': [0 for _ in range(len(dataset))],
+        'waiting_list': sharded_waiting_list,
+        'next_sample_index_by_item': [
+            int(value) + index
+            for value in base_next_sample_index
+        ],
+        'sample_index_stride': total,
+        'results_name': f'results.shard{index}of{total}.jsonl',
+        'tmp_dir_name': f'tmp_shard{index}of{total}',
+        'start_successes': 0,
+        'remaining': sum(assigned_by_item),
+    })
+    print_log(
+        f'Generation shard for {run_name}: shard={index}/{total}, '
+        f'assigned_to_generate={state["remaining"]}, '
+        f'total_to_generate={len(original_waiting_list)}',
+        level='INFO',
+    )
+    return state
+
+
+def _shard_max_sampling(max_sampling, split_opt):
+    if max_sampling is None or not split_opt.get('enabled', False):
+        return max_sampling
+    total = split_opt['total']
+    index = split_opt['index']
+    return (int(max_sampling) + total - 1 - index) // total
 
 
 def run_terminal_merge_pipeline(
@@ -759,9 +1137,11 @@ def generate_for_one_template(
         pipeline_opt=None,
         max_sampling=None,
         resume_state=None,
+        amide_check_opt=None,
     ):
     pipeline_opt = {} if pipeline_opt is None else dict(pipeline_opt)
     resume_state = {} if resume_state is None else dict(resume_state)
+    amide_check_opt = {} if amide_check_opt is None else dict(amide_check_opt)
     accepted_dir = resolve_pipeline_accepted_dir(save_dir, pipeline_opt)
     if _option_enabled(pipeline_opt):
         os.makedirs(accepted_dir, exist_ok=True)
@@ -776,10 +1156,13 @@ def generate_for_one_template(
         goal_by_item=resume_state.get('goal_by_item', None),
         successes_by_item=resume_state.get('successes_by_item', None),
         next_sample_index_by_item=resume_state.get('next_sample_index_by_item', None),
+        sample_index_stride=resume_state.get('sample_index_stride', 1),
+        results_name=resume_state.get('results_name', 'results.jsonl'),
         append=resume_state.get('append_results', False),
     )
     accepted_index = int(resume_state.get('accepted_start_index', 1))
-    tmp_save_dir = os.path.join(save_dir, 'tmp')
+    accepted_index_stride = int(resume_state.get('accepted_index_stride', 1))
+    tmp_save_dir = os.path.join(save_dir, resume_state.get('tmp_dir_name', 'tmp'))
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
     
     while not recorder.is_finished():
@@ -819,7 +1202,8 @@ def generate_for_one_template(
                 log = None
                 assert n_cycles == 0  # only the last cycle has such possibility
             else:
-                if n_cycles == 0 and _option_enabled(pipeline_opt):
+                details = reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt)
+                if details is not None and n_cycles == 0 and _option_enabled(pipeline_opt):
                     try:
                         if recorder.accepts_more(item_idx):
                             details = run_terminal_merge_pipeline(
@@ -837,8 +1221,8 @@ def generate_for_one_template(
                     except Exception as exc:
                         details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
                     if details is not None:
-                        accepted_index += 1
-                elif n_cycles == 0:
+                        accepted_index += accepted_index_stride
+                elif details is not None and n_cycles == 0:
                     details = add_terminal_rmsd_details(
                         cplx_desc,
                         details,
@@ -886,7 +1270,9 @@ def generate_for_one_template(
                     log = None
                     assert final_cycle  # only the last cycle has such possibility
                 else:
-                    if final_cycle and _option_enabled(pipeline_opt):
+                    if final_cycle:
+                        details = reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt)
+                    if details is not None and final_cycle and _option_enabled(pipeline_opt):
                         try:
                             if recorder.accepts_more(item_idx):
                                 details = run_terminal_merge_pipeline(
@@ -904,8 +1290,8 @@ def generate_for_one_template(
                         except Exception as exc:
                             details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
                         if details is not None:
-                            accepted_index += 1
-                    elif final_cycle:
+                            accepted_index += accepted_index_stride
+                    elif details is not None and final_cycle:
                         details = add_terminal_rmsd_details(
                             cplx_desc,
                             details,
@@ -982,6 +1368,19 @@ def _resolve_max_sampling(max_sampling, pipeline_opt, n_samples, dataset_size):
 def main(args, opt_args):
     config = yaml.safe_load(open(args.config, 'r'))
     config = overwrite_values(config, opt_args)
+    split_opt = _resolve_split_options(config, args)
+    base_seed = int(args.seed if args.seed is not None else config.get('seed', 12))
+    seed = base_seed + split_opt['index'] if split_opt['enabled'] else base_seed
+    setup_seed(seed)
+    if split_opt['enabled']:
+        print_log(f'Using random seed {seed} (base {base_seed} + shard {split_opt["index"]})')
+    else:
+        print_log(f'Using random seed {seed}')
+    if split_opt['enabled']:
+        print_log(
+            f'Using generation split shard {split_opt["index"]}/{split_opt["total"]}',
+            level='INFO',
+        )
 
     # load model
     ckpt = args.ckpt
@@ -1003,6 +1402,7 @@ def main(args, opt_args):
     for template_idx, template in enumerate(templates):
         template = dict(template)
         pipeline_opt = _merge_pipeline_options(config, template)
+        amide_check_opt = _merge_amide_check_options(config, template)
         n_samples = _resolve_goal_samples(config, template, pipeline_opt)
         run_name = _template_run_name(template, template_idx, class_counts)
         max_sampling_config = template.pop('max_sampling', config.get('max_sampling', None))
@@ -1018,8 +1418,19 @@ def main(args, opt_args):
         if _option_enabled(pipeline_opt):
             if getattr(dataset.config, 'term_rel_pos_sampler', None) is None:
                 raise ValueError('pipeline.enabled requires a peptide template with term_rel_pos_sdf')
+            resume_opt = _resume_options(config, pipeline_opt)
+            sanitize_opt = _sanitize_options(config, pipeline_opt, amide_check_opt)
+            if sanitize_opt.get('enabled', False):
+                if not resume_opt.get('enabled', False):
+                    raise ValueError('sanitize_generation requires resume_generation.enabled=true')
+                previous_root = _resume_previous_dir(resume_opt, args.save_dir)
+                sanitize_pipeline_accepted_dir(
+                    _resume_accepted_dir(previous_root, run_name, pipeline_opt),
+                    _dataset_lig_chain_ids(dataset),
+                    sanitize_opt,
+                )
             resume_state = build_pipeline_resume_state(
-                _resume_options(config, pipeline_opt),
+                resume_opt,
                 args.save_dir,
                 run_name,
                 out_dir,
@@ -1027,13 +1438,24 @@ def main(args, opt_args):
                 dataset,
                 n_samples,
             )
+            resume_state = apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name)
+            max_sampling_for_run = _shard_max_sampling(max_sampling, split_opt)
             print_log(
                 f'Accepted pipeline enabled: goal={n_samples * n_inputs}, '
-                f'max_sampling={max_sampling if max_sampling is not None else "unlimited"}',
+                f'max_sampling={max_sampling_for_run if max_sampling_for_run is not None else "unlimited"}',
                 level='INFO'
             )
             if resume_state is not None and resume_state['remaining'] == 0:
-                print_log(f'Resume generation for {run_name}: target already complete, skipping', level='INFO')
+                if split_opt['enabled']:
+                    print_log(f'Generation shard for {run_name}: no assigned samples, skipping', level='INFO')
+                else:
+                    print_log(f'Resume generation for {run_name}: target already complete, skipping', level='INFO')
+                continue
+        else:
+            resume_state = apply_generation_shard(None, split_opt, dataset, n_samples, run_name)
+            max_sampling_for_run = _shard_max_sampling(max_sampling, split_opt)
+            if resume_state is not None and resume_state['remaining'] == 0:
+                print_log(f'Generation shard for {run_name}: no assigned samples, skipping', level='INFO')
                 continue
         generate_for_one_template(
             model,
@@ -1044,13 +1466,13 @@ def main(args, opt_args):
             device,
             sample_opt,
             pipeline_opt=pipeline_opt,
-            max_sampling=max_sampling,
+            max_sampling=max_sampling_for_run,
             resume_state=resume_state,
+            amide_check_opt=amide_check_opt,
         )
 
 
 if __name__ == '__main__':
     args, opt_args = parse()
     print_log(f'Overwritting args: {opt_args}')
-    setup_seed(12)
     main(args, opt_args)

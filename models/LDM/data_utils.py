@@ -263,6 +263,8 @@ class Recorder:
             goal_by_item=None,
             successes_by_item=None,
             next_sample_index_by_item=None,
+            sample_index_stride=1,
+            results_name='results.jsonl',
             append=False,
         ):
         self.n_samples = int(n_samples)
@@ -300,8 +302,11 @@ class Recorder:
         self.next_sample_index_by_item = [int(value) for value in next_sample_index_by_item]
         if len(self.next_sample_index_by_item) != self.num_items:
             raise ValueError('next_sample_index_by_item must have one entry per dataset item')
+        self.sample_index_stride = int(sample_index_stride)
+        if self.sample_index_stride <= 0:
+            raise ValueError('sample_index_stride must be a positive integer')
         mode = 'a' if append else 'w'
-        self.fout = open(os.path.join(save_dir, 'results.jsonl'), mode)
+        self.fout = open(os.path.join(save_dir, results_name), mode)
 
     def accepts_more(self, item_idx=None):
         if self.num_successful >= self.total:
@@ -333,7 +338,7 @@ class Recorder:
         for offset in range(size):
             item_idx = active_item_idxs[offset % len(active_item_idxs)]
             n = self.next_sample_index_by_item[item_idx]
-            self.next_sample_index_by_item[item_idx] += 1
+            self.next_sample_index_by_item[item_idx] += self.sample_index_stride
             padded.append((item_idx, n))
         return padded
 
