@@ -251,21 +251,96 @@ def _get_item(pdb_path, sdf_path, tgt_chains):
 
 
 class Recorder:
-    def __init__(self, test_set, n_samples, save_dir, max_generated=None):
-        self.pbar = tqdm(total=n_samples * len(test_set))
-        self.waiting_list = [(i, n) for n in range(n_samples) for i in range(len(test_set))]
+    def __init__(
+            self,
+            test_set,
+            n_samples,
+            save_dir,
+            max_generated=None,
+            start_successes=0,
+            waiting_list=None,
+            keep_full_batches=False,
+            goal_by_item=None,
+            successes_by_item=None,
+            next_sample_index_by_item=None,
+            append=False,
+        ):
+        self.n_samples = int(n_samples)
+        self.num_items = len(test_set)
+        self.goal_by_item = (
+            [self.n_samples for _ in range(self.num_items)]
+            if goal_by_item is None else [int(value) for value in goal_by_item]
+        )
+        if len(self.goal_by_item) != self.num_items:
+            raise ValueError('goal_by_item must have one entry per dataset item')
+        self.successes_by_item = (
+            [0 for _ in range(self.num_items)]
+            if successes_by_item is None else [int(value) for value in successes_by_item]
+        )
+        if len(self.successes_by_item) != self.num_items:
+            raise ValueError('successes_by_item must have one entry per dataset item')
+
+        self.total = sum(self.goal_by_item)
+        self.num_successful = int(start_successes)
+        if successes_by_item is not None:
+            self.num_successful = sum(
+                min(success, goal)
+                for success, goal in zip(self.successes_by_item, self.goal_by_item)
+            )
+        self.pbar = tqdm(total=self.total, initial=self.num_successful)
+        if waiting_list is None:
+            waiting_list = [(i, n) for n in range(self.n_samples) for i in range(self.num_items)]
+        self.waiting_list = [(int(i), int(n)) for i, n in waiting_list]
+        self.required_slots = set(self.waiting_list)
+        self.keep_full_batches = bool(keep_full_batches)
         self.num_generated, self.num_failed = 0, 0
         self.max_generated = None if max_generated is None else int(max_generated)
-        self.fout = open(os.path.join(save_dir, 'results.jsonl'), 'w')
+        if next_sample_index_by_item is None:
+            next_sample_index_by_item = [self.n_samples for _ in range(self.num_items)]
+        self.next_sample_index_by_item = [int(value) for value in next_sample_index_by_item]
+        if len(self.next_sample_index_by_item) != self.num_items:
+            raise ValueError('next_sample_index_by_item must have one entry per dataset item')
+        mode = 'a' if append else 'w'
+        self.fout = open(os.path.join(save_dir, 'results.jsonl'), mode)
+
+    def accepts_more(self, item_idx=None):
+        if self.num_successful >= self.total:
+            return False
+        if item_idx is None:
+            return True
+        return self.successes_by_item[item_idx] < self.goal_by_item[item_idx]
 
     def is_finished(self):
-        if len(self.waiting_list) == 0:
+        if self.num_successful >= self.total:
             return True
-        if self.max_generated is None:
-            return False
-        return self.num_generated >= self.max_generated
+        if self.max_generated is not None and self.num_generated >= self.max_generated:
+            return True
+        return len(self.waiting_list) == 0
+
+    def _get_padding_batch_list(self, seed_batch, size):
+        active_item_idxs = []
+        for item_idx, _ in seed_batch:
+            if self.accepts_more(item_idx) and item_idx not in active_item_idxs:
+                active_item_idxs.append(item_idx)
+        if not active_item_idxs:
+            active_item_idxs = [
+                item_idx for item_idx in range(self.num_items)
+                if self.accepts_more(item_idx)
+            ]
+        if not active_item_idxs:
+            return []
+        padded = []
+        for offset in range(size):
+            item_idx = active_item_idxs[offset % len(active_item_idxs)]
+            n = self.next_sample_index_by_item[item_idx]
+            self.next_sample_index_by_item[item_idx] += 1
+            padded.append((item_idx, n))
+        return padded
 
     def get_next_batch_list(self, batch_size):
+        if self.is_finished():
+            return []
+        batch_size = int(batch_size)
         if self.max_generated is not None:
             remaining = self.max_generated - self.num_generated
             if remaining <= 0:
@@ -273,22 +348,40 @@ class Recorder:
             batch_size = min(batch_size, remaining)
         batch_list = self.waiting_list[:batch_size]
         self.waiting_list = self.waiting_list[batch_size:]
+        if self.keep_full_batches and 0 < len(batch_list) < batch_size:
+            batch_list.extend(self._get_padding_batch_list(batch_list, batch_size - len(batch_list)))
         return batch_list
 
     def check_and_save(self, log, item_idx, n, struct_only=False):
         self.num_generated += 1
+        slot = (int(item_idx), int(n))
         if log is None:
-            self.num_failed += 1
-            if self.max_generated is None or self.num_generated < self.max_generated:
-                self.waiting_list.append((item_idx, n))
+            if self.accepts_more(item_idx):
+                self.num_failed += 1
+                if slot in self.required_slots and (
+                        self.max_generated is None or self.num_generated < self.max_generated
+                    ):
+                    self.waiting_list.append(slot)
+            else:
+                self.required_slots.discard(slot)
+            return False
         else:
+            if not self.accepts_more(item_idx):
+                self.required_slots.discard(slot)
+                return False
             log.update({
                 'n': n,
                 'struct_only': struct_only
             })
             self.fout.write(json.dumps(log) + '\n')
             self.fout.flush()
+            self.num_successful += 1
+            self.successes_by_item[item_idx] += 1
+            self.required_slots.discard(slot)
             self.pbar.update(1)
+            return True
 
     def __del__(self):
-        self.fout.close()
+        fout = getattr(self, 'fout', None)
+        if fout is not None and not fout.closed:
+            fout.close()

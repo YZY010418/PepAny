@@ -2,6 +2,7 @@
 # -*- coding:utf-8 -*-
 import inspect
 import os
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -23,19 +24,102 @@ def _pdb_to_complex_supports_preserve_residue_names():
 
 
 class PDBDataset(torch.utils.data.Dataset):
-    def __init__(self, pdb_paths: List[str], tgt_chains: List[List[str]], lig_chains: List[List[str]], template_config: BaseTemplate, n_samples: int=1):
+    def __init__(
+            self,
+            pdb_paths: List[str] = None,
+            tgt_chains: List[List[str]] = None,
+            lig_chains: List[List[str]] = None,
+            template_config: BaseTemplate = None,
+            n_samples: int = 1,
+            pdb_dir: str = None,
+            pdb_pattern: str = '*.pdb',
+            recursive: bool = False,
+            ligand_size_mode: str = 'ca',
+        ):
         super().__init__()
         self.config = template_config
-        self.pdb_paths = pdb_paths
-        self.tgt_chains = tgt_chains
-        self.lig_chains = lig_chains
-        self.cplxs, self.pocket_block_ids = [], []
+        self.pdb_paths = self._resolve_pdb_paths(pdb_paths, pdb_dir, pdb_pattern, recursive)
+        self.tgt_chains = self._normalize_chain_specs(tgt_chains, len(self.pdb_paths), 'tgt_chains')
+        self.lig_chains = self._normalize_chain_specs(lig_chains, len(self.pdb_paths), 'lig_chains')
+        self.ligand_size_mode = ligand_size_mode
+        self.cplxs, self.pocket_block_ids, self.ref_ligand_sizes = [], [], []
         preserve_residue_names = getattr(self.config, 'preserve_residue_names', None)
-        for path, tgt, lig in zip(pdb_paths, tgt_chains, lig_chains):
+        for path, tgt, lig in zip(self.pdb_paths, self.tgt_chains, self.lig_chains):
             cplx, pocket_block_ids = self._process_pdb(path, tgt, lig, preserve_residue_names=preserve_residue_names)
             self.cplxs.append(cplx)
             self.pocket_block_ids.append(pocket_block_ids)
+            self.ref_ligand_sizes.append(self._ligand_size(cplx, lig[0], ligand_size_mode))
         self.n_samples = n_samples
+
+    def _resolve_pdb_paths(self, pdb_paths, pdb_dir, pdb_pattern, recursive):
+        if pdb_paths is not None and pdb_dir is not None:
+            raise ValueError('Specify either dataset.pdb_paths or dataset.pdb_dir, not both')
+        if pdb_dir is not None:
+            root = Path(pdb_dir)
+            iterator = root.rglob(pdb_pattern) if recursive else root.glob(pdb_pattern)
+            pdb_paths = sorted(str(path) for path in iterator if path.is_file())
+            if not pdb_paths:
+                raise ValueError(f'No PDB files matching {pdb_pattern!r} found in {pdb_dir}')
+        if pdb_paths is None:
+            raise ValueError('Set either dataset.pdb_paths or dataset.pdb_dir')
+        return [str(path) for path in pdb_paths]
+
+    def _as_chain_list(self, value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        raise ValueError(f'Chain specification must be a string or list of strings, got {type(value)}')
+
+    def _normalize_chain_specs(self, value, n_items, name):
+        if value is None:
+            raise ValueError(f'Set dataset.{name}')
+        if isinstance(value, str):
+            return [[value] for _ in range(n_items)]
+        if not isinstance(value, (list, tuple)) or len(value) == 0:
+            raise ValueError(f'dataset.{name} must be a string, list of strings, or list of chain lists')
+
+        has_nested = any(isinstance(item, (list, tuple)) for item in value)
+        if has_nested:
+            specs = [self._as_chain_list(item) for item in value]
+            if len(specs) == 1 and n_items > 1:
+                return specs * n_items
+            if len(specs) != n_items:
+                raise ValueError(f'dataset.{name} has {len(specs)} entries for {n_items} PDB files')
+            return specs
+
+        if n_items == 1:
+            return [self._as_chain_list(value)]
+        if len(value) == 1:
+            return [[str(value[0])] for _ in range(n_items)]
+        if len(value) == n_items:
+            return [[str(item)] for item in value]
+        raise ValueError(
+            f'dataset.{name} is ambiguous for {n_items} PDB files. '
+            f'Use a string for one global chain, a single nested list like [[A, B]] for global '
+            f'multiple chains, or a list of {n_items} per-file entries.'
+        )
+
+    def _has_atom(self, block, atom_name):
+        return any(atom.name == atom_name for atom in block)
+
+    def _ligand_size(self, cplx, lig_chain, mode):
+        blocks = list(cplx[lig_chain])
+        mode = str(mode)
+        if mode == 'blocks':
+            return len(blocks)
+        if mode in {'ca', 'res_ca', 'residue_ca'}:
+            return len({
+                tuple(block.id)
+                for block in blocks
+                if block.name not in {'ACE', 'NME', 'CAP'} and self._has_atom(block, 'CA')
+            })
+        if mode == 'backbone':
+            return sum(
+                1 for block in blocks
+                if all(self._has_atom(block, atom_name) for atom_name in ('N', 'CA', 'C', 'O'))
+            )
+        raise ValueError(f'Unknown ligand_size_mode: {mode}')
 
     def __getitem__(self, idx):
         idx = idx // self.n_samples
@@ -49,7 +133,8 @@ class PDBDataset(torch.utils.data.Dataset):
             cplx=cplx,
             tgt_chains=list(self.tgt_chains[idx]),
             lig_chains=list(self.lig_chains[idx]),
-            pocket_block_ids=pocket_block_ids
+            pocket_block_ids=pocket_block_ids,
+            ref_ligand_size=self.ref_ligand_sizes[idx],
         ))
 
         dummy_lig_block_ids = cplx_desc.lig_block_ids

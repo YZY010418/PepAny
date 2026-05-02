@@ -4,6 +4,7 @@ import os
 import shutil
 import argparse
 import csv
+import re
 from copy import deepcopy
 from pathlib import Path
 
@@ -438,6 +439,212 @@ def append_pipeline_metadata(accepted_dir, row):
         writer.writerow({field: row.get(field, '') for field in PIPELINE_METADATA_FIELDS})
 
 
+def resolve_pipeline_accepted_dir(save_dir, pipeline_opt):
+    output_dir = pipeline_opt.get('output_dir', None)
+    if output_dir is None:
+        return os.path.join(os.path.dirname(save_dir), 'accepted')
+    if os.path.isabs(output_dir):
+        return output_dir
+    return os.path.join(os.path.dirname(save_dir), output_dir)
+
+
+def _pipeline_output_dir_name(pipeline_opt):
+    output_dir = pipeline_opt.get('output_dir', None)
+    if output_dir is None or os.path.isabs(output_dir):
+        return 'accepted'
+    return output_dir
+
+
+def _read_pipeline_metadata(accepted_dir):
+    metadata_path = Path(accepted_dir) / 'metadata.csv'
+    if not metadata_path.exists():
+        return []
+    with metadata_path.open(newline='') as handle:
+        return list(csv.DictReader(handle))
+
+
+def _accepted_index(name):
+    match = re.search(r'accepted_(\d+)$', str(name or ''))
+    return None if match is None else int(match.group(1))
+
+
+def _safe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _existing_pipeline_state(accepted_dir, target_ids):
+    accepted_dir = Path(accepted_dir)
+    rows = _read_pipeline_metadata(accepted_dir)
+    counts_by_id = {target_id: 0 for target_id in target_ids}
+    sample_slot_max_by_id = {target_id: -1 for target_id in target_ids}
+    max_accepted_index = 0
+
+    for row in rows:
+        accepted_name = row.get('accepted_name', '')
+        if not accepted_name and row.get('accepted_cif', ''):
+            accepted_name = Path(row['accepted_cif']).stem
+        index = _accepted_index(accepted_name)
+        if index is not None:
+            max_accepted_index = max(max_accepted_index, index)
+
+        target_id = row.get('id', '')
+        if target_id not in counts_by_id and len(target_ids) == 1:
+            target_id = target_ids[0]
+        if target_id in counts_by_id:
+            counts_by_id[target_id] += 1
+            sample_slot = _safe_int(row.get('sample_slot', None))
+            if sample_slot is not None:
+                sample_slot_max_by_id[target_id] = max(
+                    sample_slot_max_by_id[target_id],
+                    sample_slot,
+                )
+
+    for cif_path in accepted_dir.glob('accepted_*.cif'):
+        index = _accepted_index(cif_path.stem)
+        if index is not None:
+            max_accepted_index = max(max_accepted_index, index)
+    if not rows and len(target_ids) == 1:
+        counts_by_id[target_ids[0]] = len(list(accepted_dir.glob('accepted_*.cif')))
+
+    return {
+        'rows': rows,
+        'counts_by_id': counts_by_id,
+        'sample_slot_max_by_id': sample_slot_max_by_id,
+        'max_accepted_index': max_accepted_index,
+    }
+
+
+def _max_candidate_slot(candidate_dir, target_id):
+    target_dir = Path(candidate_dir) / target_id
+    max_slot = -1
+    if not target_dir.exists():
+        return max_slot
+    for pdb_path in target_dir.glob('*.pdb'):
+        slot = _safe_int(pdb_path.stem)
+        if slot is not None:
+            max_slot = max(max_slot, slot)
+    return max_slot
+
+
+def _resume_options(config, pipeline_opt):
+    raw_global = config.get('resume_generation', None)
+    raw_pipeline = pipeline_opt.get('resume_generation', None)
+    options = {}
+    for raw in (raw_global, raw_pipeline):
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            options.update(raw)
+        else:
+            options['enabled'] = bool(raw)
+    for source in (config, pipeline_opt):
+        for key in ('previous_dir', 'resume_dir', 'resume_from'):
+            if key in source:
+                options[key] = source[key]
+    options['enabled'] = bool(options.get('enabled', False))
+    return options
+
+
+def _resume_accepted_dir(previous_dir, run_name, pipeline_opt):
+    root = Path(previous_dir)
+    output_dir = _pipeline_output_dir_name(pipeline_opt)
+    candidates = []
+    configured_output_dir = pipeline_opt.get('output_dir', None)
+    if configured_output_dir is not None and os.path.isabs(configured_output_dir):
+        candidates.append(Path(configured_output_dir))
+    candidates.extend([
+        root / run_name / output_dir,
+        root / output_dir,
+        root,
+    ])
+    for candidate in candidates:
+        if (candidate / 'metadata.csv').exists() or any(candidate.glob('accepted_*.cif')):
+            return candidate
+    return candidates[0]
+
+
+def _dataset_item_target_ids(dataset):
+    sample_repeat = max(1, int(getattr(dataset, 'n_samples', 1)))
+    ids = []
+    for item_idx in range(len(dataset)):
+        pdb_idx = min(item_idx // sample_repeat, len(dataset.pdb_paths) - 1)
+        ids.append(Path(dataset.pdb_paths[pdb_idx]).stem)
+    return ids
+
+
+def build_pipeline_resume_state(
+        resume_opt,
+        save_root,
+        run_name,
+        candidate_dir,
+        pipeline_opt,
+        dataset,
+        n_samples,
+    ):
+    if not resume_opt.get('enabled', False):
+        return None
+
+    previous_dir = _get_first(
+        resume_opt,
+        ('previous_dir', 'resume_dir', 'resume_from', 'path', 'dir'),
+        None,
+    )
+    if previous_dir is None:
+        previous_dir = save_root
+    previous_root = Path(previous_dir)
+    if not previous_root.exists():
+        raise ValueError(f'resume_generation previous_dir does not exist: {previous_dir}')
+
+    target_ids = _dataset_item_target_ids(dataset)
+    accepted_dir = _resume_accepted_dir(previous_root, run_name, pipeline_opt)
+    existing = _existing_pipeline_state(accepted_dir, target_ids)
+    counts_by_id = existing['counts_by_id']
+    sample_slot_max_by_id = existing['sample_slot_max_by_id']
+
+    goal_by_item, successes_by_item, waiting_list, next_sample_index_by_item = [], [], [], []
+    total_remaining = 0
+    for item_idx, target_id in enumerate(target_ids):
+        existing_count = counts_by_id.get(target_id, 0)
+        clipped_existing = min(existing_count, n_samples)
+        remaining = max(0, n_samples - clipped_existing)
+        goal_by_item.append(n_samples)
+        successes_by_item.append(clipped_existing)
+        next_slot = max(
+            n_samples,
+            sample_slot_max_by_id.get(target_id, -1) + 1,
+            _max_candidate_slot(candidate_dir, target_id) + 1,
+        )
+        for offset in range(remaining):
+            waiting_list.append((item_idx, next_slot + offset))
+        next_sample_index_by_item.append(next_slot + remaining)
+        total_remaining += remaining
+        print_log(
+            f'Resume target {run_name}/{target_id}: '
+            f'existing={existing_count}, goal={n_samples}, to_generate={remaining}',
+            level='INFO',
+        )
+
+    print_log(
+        f'Resume generation for {run_name}: previous accepted dir={accepted_dir}, '
+        f'total_to_generate={total_remaining}',
+        level='INFO',
+    )
+    return {
+        'accepted_start_index': existing['max_accepted_index'] + 1,
+        'append_results': True,
+        'goal_by_item': goal_by_item,
+        'successes_by_item': successes_by_item,
+        'waiting_list': waiting_list,
+        'next_sample_index_by_item': next_sample_index_by_item,
+        'start_successes': sum(successes_by_item),
+        'remaining': total_remaining,
+        'previous_accepted_dir': str(accepted_dir),
+    }
+
+
 def run_terminal_merge_pipeline(
         cplx_desc,
         details,
@@ -551,19 +758,27 @@ def generate_for_one_template(
         sample_opt,
         pipeline_opt=None,
         max_sampling=None,
+        resume_state=None,
     ):
     pipeline_opt = {} if pipeline_opt is None else dict(pipeline_opt)
-    output_dir = pipeline_opt.get('output_dir', None)
-    if output_dir is None:
-        accepted_dir = os.path.join(os.path.dirname(save_dir), 'accepted')
-    elif os.path.isabs(output_dir):
-        accepted_dir = output_dir
-    else:
-        accepted_dir = os.path.join(os.path.dirname(save_dir), output_dir)
+    resume_state = {} if resume_state is None else dict(resume_state)
+    accepted_dir = resolve_pipeline_accepted_dir(save_dir, pipeline_opt)
     if _option_enabled(pipeline_opt):
         os.makedirs(accepted_dir, exist_ok=True)
-    recorder = Recorder(dataset, n_samples, save_dir, max_generated=max_sampling)
-    accepted_count = 0
+    recorder = Recorder(
+        dataset,
+        n_samples,
+        save_dir,
+        max_generated=max_sampling,
+        start_successes=resume_state.get('start_successes', 0),
+        waiting_list=resume_state.get('waiting_list', None),
+        keep_full_batches=_option_enabled(pipeline_opt),
+        goal_by_item=resume_state.get('goal_by_item', None),
+        successes_by_item=resume_state.get('successes_by_item', None),
+        next_sample_index_by_item=resume_state.get('next_sample_index_by_item', None),
+        append=resume_state.get('append_results', False),
+    )
+    accepted_index = int(resume_state.get('accepted_start_index', 1))
     tmp_save_dir = os.path.join(save_dir, 'tmp')
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
     
@@ -585,10 +800,13 @@ def generate_for_one_template(
             item_idx, n = batch_list[i]
             cplx_desc = cplx_descs[i]
 
-            if n == 0:
-                os.makedirs(os.path.join(tmp_save_dir, cplx_desc.id), exist_ok=True)
-                os.makedirs(os.path.join(save_dir, cplx_desc.id), exist_ok=True)
-                complex_to_pdb(cplx_desc.cplx, os.path.join(tmp_save_dir, cplx_desc.id, 'pocket.pdb'), cplx_desc.tgt_chains)
+            tmp_target_dir = os.path.join(tmp_save_dir, cplx_desc.id)
+            target_dir = os.path.join(save_dir, cplx_desc.id)
+            pocket_path = os.path.join(tmp_target_dir, 'pocket.pdb')
+            os.makedirs(tmp_target_dir, exist_ok=True)
+            os.makedirs(target_dir, exist_ok=True)
+            if n == 0 or not os.path.exists(pocket_path):
+                complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
 
             if n_cycles == 0: out_path = os.path.join(save_dir, cplx_desc.id, str(n) + '.pdb')
             else: out_path = os.path.join(tmp_save_dir, cplx_desc.id, str(n) + '.pdb')
@@ -603,20 +821,23 @@ def generate_for_one_template(
             else:
                 if n_cycles == 0 and _option_enabled(pipeline_opt):
                     try:
-                        details = run_terminal_merge_pipeline(
-                            cplx_desc,
-                            details,
-                            n,
-                            out_path,
-                            out_path.rstrip('.pdb') + '.sdf',
-                            accepted_dir,
-                            pipeline_opt,
-                            accepted_count + 1,
-                        )
+                        if recorder.accepts_more(item_idx):
+                            details = run_terminal_merge_pipeline(
+                                cplx_desc,
+                                details,
+                                n,
+                                out_path,
+                                out_path.rstrip('.pdb') + '.sdf',
+                                accepted_dir,
+                                pipeline_opt,
+                                accepted_index,
+                            )
+                        else:
+                            details = None
                     except Exception as exc:
                         details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
                     if details is not None:
-                        accepted_count += 1
+                        accepted_index += 1
                 elif n_cycles == 0:
                     details = add_terminal_rmsd_details(
                         cplx_desc,
@@ -667,20 +888,23 @@ def generate_for_one_template(
                 else:
                     if final_cycle and _option_enabled(pipeline_opt):
                         try:
-                            details = run_terminal_merge_pipeline(
-                                cplx_desc,
-                                details,
-                                n,
-                                out_path,
-                                out_path.rstrip('.pdb') + '.sdf',
-                                accepted_dir,
-                                pipeline_opt,
-                                accepted_count + 1,
-                            )
+                            if recorder.accepts_more(item_idx):
+                                details = run_terminal_merge_pipeline(
+                                    cplx_desc,
+                                    details,
+                                    n,
+                                    out_path,
+                                    out_path.rstrip('.pdb') + '.sdf',
+                                    accepted_dir,
+                                    pipeline_opt,
+                                    accepted_index,
+                                )
+                            else:
+                                details = None
                         except Exception as exc:
                             details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
                         if details is not None:
-                            accepted_count += 1
+                            accepted_index += 1
                     elif final_cycle:
                         details = add_terminal_rmsd_details(
                             cplx_desc,
@@ -733,8 +957,7 @@ def _resolve_goal_samples(config, template, pipeline_opt):
     return n_samples
 
 
-def _resolve_max_sampling(config, template, pipeline_opt, n_samples, dataset_size):
-    max_sampling = template.pop('max_sampling', config.get('max_sampling', None))
+def _resolve_max_sampling(max_sampling, pipeline_opt, n_samples, dataset_size):
     pipeline_max_sampling = _get_first(
         pipeline_opt,
         ('max_sampling', 'max_sampling_number', 'max_samples', 'max_attempts'),
@@ -782,23 +1005,36 @@ def main(args, opt_args):
         pipeline_opt = _merge_pipeline_options(config, template)
         n_samples = _resolve_goal_samples(config, template, pipeline_opt)
         run_name = _template_run_name(template, template_idx, class_counts)
-        max_sampling = _resolve_max_sampling(config, template, pipeline_opt, n_samples, len(config['dataset']['pdb_paths']))
+        max_sampling_config = template.pop('max_sampling', config.get('max_sampling', None))
         print_log(f'Generating for template: {template}')
         print_log(f'Run name: {run_name}, n_samples: {n_samples}')
         run_dir = os.path.join(args.save_dir, run_name)
         out_dir = os.path.join(run_dir, 'candidates')
         os.makedirs(out_dir, exist_ok=True)
         dataset = PDBDataset(**config['dataset'], template_config=R.construct(template))
+        n_inputs = len(dataset.pdb_paths)
+        max_sampling = _resolve_max_sampling(max_sampling_config, pipeline_opt, n_samples, n_inputs)
+        resume_state = None
         if _option_enabled(pipeline_opt):
-            if max_sampling is None:
-                raise ValueError('pipeline.enabled requires max_sampling/max_sampling_number')
             if getattr(dataset.config, 'term_rel_pos_sampler', None) is None:
                 raise ValueError('pipeline.enabled requires a peptide template with term_rel_pos_sdf')
+            resume_state = build_pipeline_resume_state(
+                _resume_options(config, pipeline_opt),
+                args.save_dir,
+                run_name,
+                out_dir,
+                pipeline_opt,
+                dataset,
+                n_samples,
+            )
             print_log(
-                f'Accepted pipeline enabled: goal={n_samples * len(dataset)}, '
-                f'max_sampling={max_sampling}',
+                f'Accepted pipeline enabled: goal={n_samples * n_inputs}, '
+                f'max_sampling={max_sampling if max_sampling is not None else "unlimited"}',
                 level='INFO'
             )
+            if resume_state is not None and resume_state['remaining'] == 0:
+                print_log(f'Resume generation for {run_name}: target already complete, skipping', level='INFO')
+                continue
         generate_for_one_template(
             model,
             dataset,
@@ -809,6 +1045,7 @@ def main(args, opt_args):
             sample_opt,
             pipeline_opt=pipeline_opt,
             max_sampling=max_sampling,
+            resume_state=resume_state,
         )
 
 

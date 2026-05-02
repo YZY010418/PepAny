@@ -22,13 +22,16 @@ class ComplexDesc:
     generate_mask: List[int] = None
     topo_generate_mask: Optional[List[int]] = None
     control: Optional[dict] = None
+    ref_ligand_size: Optional[int] = None
 
 
 @R.register('BaseTemplate')
 class BaseTemplate:
-    def __init__(self, size_min=None, size_max=None):
+    def __init__(self, size_min=None, size_max=None, size_from_ligand=False, ligand_size_offset=0):
         self.size_min = size_min
         self.size_max = size_max
+        self.size_from_ligand = bool(size_from_ligand)
+        self.ligand_size_offset = int(ligand_size_offset)
         self.preserve_residue_names = ()
 
     @property
@@ -36,6 +39,13 @@ class BaseTemplate:
         return self.__class__.__name__
 
     def sample_size(self, cplx_desc: ComplexDesc):
+        if self.size_from_ligand:
+            if cplx_desc.ref_ligand_size is None:
+                raise ValueError('size_from_ligand=True requires ref_ligand_size from the dataset')
+            size = int(cplx_desc.ref_ligand_size) + self.ligand_size_offset
+            if size <= 0:
+                raise ValueError(f'size_from_ligand produced non-positive size: {size}')
+            return size
         return np.random.randint(self.size_min, self.size_max)
 
     def remove_ref_lig(self, cplx_desc: ComplexDesc) -> Complex:

@@ -111,8 +111,21 @@ class TermRelPosSDFSampler:
 @R.register('LinearPeptide')
 class LinearPeptide(BaseTemplate):
 
-    def __init__(self, size_min=None, size_max=None, term_rel_pos=None, term_rel_pos_sdf=None):
-        super().__init__(size_min, size_max)
+    def __init__(
+            self,
+            size_min=None,
+            size_max=None,
+            term_rel_pos=None,
+            term_rel_pos_sdf=None,
+            size_from_ligand=False,
+            ligand_size_offset=0,
+        ):
+        super().__init__(
+            size_min,
+            size_max,
+            size_from_ligand=size_from_ligand,
+            ligand_size_offset=ligand_size_offset,
+        )
         if term_rel_pos is not None and term_rel_pos_sdf is not None:
             raise ValueError('Specify either term_rel_pos or term_rel_pos_sdf, not both')
         self.term_rel_pos_sampler = None
@@ -163,13 +176,22 @@ class CappedLinearPeptide(LinearPeptide):
             size_max=None,
             term_rel_pos=None,
             term_rel_pos_sdf=None,
+            size_from_ligand=False,
+            ligand_size_offset=0,
             n_cap_block_index=0,
             c_cap_block_index=-1,
             n_cap_residue_name=None,
             c_cap_residue_name=None,
             preserve_residue_names=None,
         ):
-        super().__init__(size_min, size_max, term_rel_pos, term_rel_pos_sdf)
+        super().__init__(
+            size_min,
+            size_max,
+            term_rel_pos,
+            term_rel_pos_sdf,
+            size_from_ligand=size_from_ligand,
+            ligand_size_offset=ligand_size_offset,
+        )
         self.n_cap_block_index = n_cap_block_index
         self.c_cap_block_index = c_cap_block_index
         self.n_cap_residue_name = n_cap_residue_name
@@ -292,10 +314,19 @@ class DeNovoCappedLinearPeptide(LinearPeptide):
             size_max=None,
             term_rel_pos=None,
             term_rel_pos_sdf=None,
+            size_from_ligand=False,
+            ligand_size_offset=0,
             n_cap_name='ACE',
             c_cap_name='NME',
         ):
-        super().__init__(size_min, size_max, term_rel_pos, term_rel_pos_sdf)
+        super().__init__(
+            size_min,
+            size_max,
+            term_rel_pos,
+            term_rel_pos_sdf,
+            size_from_ligand=size_from_ligand,
+            ligand_size_offset=ligand_size_offset,
+        )
         self.n_cap_name = str(n_cap_name)
         self.c_cap_name = str(c_cap_name)
 
