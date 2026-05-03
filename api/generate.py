@@ -775,16 +775,124 @@ def _existing_pipeline_state(accepted_dir, target_ids):
     }
 
 
-def _max_candidate_slot(candidate_dir, target_id):
-    target_dir = Path(candidate_dir) / target_id
-    max_slot = -1
-    if not target_dir.exists():
-        return max_slot
-    for pdb_path in target_dir.glob('*.pdb'):
-        slot = _safe_int(pdb_path.stem)
-        if slot is not None:
-            max_slot = max(max_slot, slot)
-    return max_slot
+def _candidate_slots(candidate_dirs, target_id):
+    if isinstance(candidate_dirs, (str, Path)):
+        candidate_dirs = [candidate_dirs]
+    slots = set()
+    for candidate_dir in candidate_dirs:
+        target_dir = Path(candidate_dir) / target_id
+        if not target_dir.exists():
+            continue
+        for candidate_path in list(target_dir.glob('*.pdb')) + list(target_dir.glob('*.sdf')):
+            slot = _safe_int(candidate_path.stem)
+            if slot is not None:
+                slots.add(slot)
+    return slots
+
+
+def _max_candidate_slot(candidate_dirs, target_id):
+    slots = _candidate_slots(candidate_dirs, target_id)
+    return max(slots) if slots else -1
+
+
+def _candidate_attempt_count(candidate_dirs, target_id):
+    return len(_candidate_slots(candidate_dirs, target_id))
+
+
+def _candidate_stats_files(candidate_dir):
+    candidate_dir = Path(candidate_dir)
+    exact_path = candidate_dir / 'generation_stats.json'
+    if exact_path.exists():
+        return [exact_path]
+    return sorted(candidate_dir.glob('generation_stats*.json'))
+
+
+def _read_generation_stats_file(stats_path):
+    try:
+        with Path(stats_path).open() as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        print_log(f'Could not read generation stats {stats_path}: {exc}', level='WARN')
+        return None
+    if not isinstance(data, dict):
+        print_log(f'Ignoring malformed generation stats {stats_path}: expected JSON object', level='WARN')
+        return None
+    return data
+
+
+def _read_generation_stats(candidate_dirs):
+    if isinstance(candidate_dirs, (str, Path)):
+        candidate_dirs = [candidate_dirs]
+    stats_files = []
+    seen = set()
+    for candidate_dir in candidate_dirs:
+        for stats_path in _candidate_stats_files(candidate_dir):
+            key = str(stats_path.resolve()) if stats_path.exists() else str(stats_path.absolute())
+            if key in seen:
+                continue
+            seen.add(key)
+            stats_files.append(stats_path)
+
+    if not stats_files:
+        return None
+
+    total_generated = 0
+    has_total = False
+    per_target_generated = {}
+    for stats_path in stats_files:
+        stats = _read_generation_stats_file(stats_path)
+        if stats is None:
+            continue
+        generated = _safe_int(stats.get('generated_candidates', None))
+        if generated is not None:
+            total_generated += generated
+            has_total = True
+        per_target = stats.get('per_target', {})
+        if isinstance(per_target, dict):
+            for target_id, target_stats in per_target.items():
+                if not isinstance(target_stats, dict):
+                    continue
+                target_generated = _safe_int(target_stats.get('generated_candidates', None))
+                if target_generated is not None:
+                    per_target_generated[target_id] = per_target_generated.get(target_id, 0) + target_generated
+
+    if not has_total and not per_target_generated:
+        return None
+    return {
+        'stats_files': [str(path) for path in stats_files],
+        'generated_candidates': total_generated if has_total else None,
+        'per_target_generated': per_target_generated,
+    }
+
+
+def _resume_candidate_dir(previous_dir, run_name):
+    root = Path(previous_dir)
+    candidates = [
+        root / run_name / 'candidates',
+        root / 'candidates',
+        root,
+    ]
+    for candidate in candidates:
+        if (
+                any(candidate.glob('generation_stats*.json'))
+                or any(candidate.glob('*/*.pdb'))
+                or any(candidate.glob('*/*.sdf'))
+            ):
+            return candidate
+    return candidates[0]
+
+
+def _unique_paths(paths):
+    unique = []
+    seen = set()
+    for path in paths:
+        path = Path(path)
+        key = str(path.resolve()) if path.exists() else str(path.absolute())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 def _resume_options(config, pipeline_opt):
@@ -804,6 +912,25 @@ def _resume_options(config, pipeline_opt):
                 options[key] = source[key]
     options['enabled'] = bool(options.get('enabled', False))
     return options
+
+
+def _resume_remaining_sampling_budget(resume_opt):
+    raw_budget = _get_first(
+        resume_opt,
+        (
+            'remaining_sampling_budget',
+            'remaining_sample_budget',
+            'remaining_max_sampling',
+            'remaining_max_sampling_number',
+        ),
+        None,
+    )
+    if raw_budget is None:
+        return None
+    budget = int(raw_budget)
+    if budget < 0:
+        raise ValueError('resume_generation.remaining_sampling_budget must be >= 0')
+    return budget
 
 
 def _sanitize_options(config, pipeline_opt, amide_check_opt):
@@ -891,36 +1018,68 @@ def build_pipeline_resume_state(
 
     target_ids = _dataset_item_target_ids(dataset)
     accepted_dir = _resume_accepted_dir(previous_root, run_name, pipeline_opt)
+    previous_candidate_dir = _resume_candidate_dir(previous_root, run_name)
+    candidate_dirs = _unique_paths([previous_candidate_dir, candidate_dir])
+    generation_stats = _read_generation_stats(candidate_dirs)
+    per_target_generated = {}
+    stats_total_generated = None
+    if generation_stats is not None:
+        per_target_generated = generation_stats.get('per_target_generated', {})
+        stats_total_generated = generation_stats.get('generated_candidates', None)
+        print_log(
+            f'Resume generation stats for {run_name}: '
+            f'files={generation_stats.get("stats_files", [])}, '
+            f'generated_candidates={stats_total_generated}',
+            level='INFO',
+        )
     existing = _existing_pipeline_state(accepted_dir, target_ids)
     counts_by_id = existing['counts_by_id']
     sample_slot_max_by_id = existing['sample_slot_max_by_id']
 
     goal_by_item, successes_by_item, waiting_list, next_sample_index_by_item = [], [], [], []
+    generated_by_item, accepted_existing_by_item, candidate_slots_by_item = [], [], []
     total_remaining = 0
     for item_idx, target_id in enumerate(target_ids):
         existing_count = counts_by_id.get(target_id, 0)
+        candidate_slots = sorted(_candidate_slots(candidate_dirs, target_id))
+        file_attempts = len(candidate_slots)
+        stats_attempts = per_target_generated.get(target_id, None)
+        existing_attempts = int(stats_attempts) if stats_attempts is not None else file_attempts
         clipped_existing = min(existing_count, n_samples)
         remaining = max(0, n_samples - clipped_existing)
         goal_by_item.append(n_samples)
         successes_by_item.append(clipped_existing)
+        generated_by_item.append(existing_attempts)
+        accepted_existing_by_item.append(existing_count)
+        candidate_slots_by_item.append(candidate_slots)
         next_slot = max(
             n_samples,
             sample_slot_max_by_id.get(target_id, -1) + 1,
-            _max_candidate_slot(candidate_dir, target_id) + 1,
+            _max_candidate_slot(candidate_dirs, target_id) + 1,
         )
         for offset in range(remaining):
             waiting_list.append((item_idx, next_slot + offset))
         next_sample_index_by_item.append(next_slot + remaining)
         total_remaining += remaining
+        success_rate = existing_count / existing_attempts if existing_attempts else 0.0
+        attempt_source = 'generation_stats.json' if stats_attempts is not None else 'candidate files'
         print_log(
             f'Resume target {run_name}/{target_id}: '
-            f'existing={existing_count}, goal={n_samples}, to_generate={remaining}',
+            f'existing={existing_count}, previous_candidates={existing_attempts} '
+            f'({attempt_source}), '
+            f'success_rate={success_rate:.4f}, goal={n_samples}, to_generate={remaining}',
             level='INFO',
         )
 
+    start_generated = (
+        int(stats_total_generated)
+        if stats_total_generated is not None
+        else sum(generated_by_item)
+    )
     print_log(
         f'Resume generation for {run_name}: previous accepted dir={accepted_dir}, '
-        f'total_to_generate={total_remaining}',
+        f'previous candidates dir={previous_candidate_dir}, '
+        f'previous_candidates={start_generated}, total_to_generate={total_remaining}',
         level='INFO',
     )
     return {
@@ -928,11 +1087,16 @@ def build_pipeline_resume_state(
         'append_results': True,
         'goal_by_item': goal_by_item,
         'successes_by_item': successes_by_item,
+        'generated_by_item': generated_by_item,
+        'accepted_existing_by_item': accepted_existing_by_item,
+        'candidate_slots_by_item': candidate_slots_by_item,
         'waiting_list': waiting_list,
         'next_sample_index_by_item': next_sample_index_by_item,
         'start_successes': sum(successes_by_item),
+        'start_generated': start_generated,
         'remaining': total_remaining,
         'previous_accepted_dir': str(accepted_dir),
+        'previous_candidate_dir': str(previous_candidate_dir),
     }
 
 
@@ -1136,6 +1300,9 @@ def _default_generation_state(dataset, n_samples):
         'append_results': False,
         'goal_by_item': [n_samples for _ in range(len(dataset))],
         'successes_by_item': [0 for _ in range(len(dataset))],
+        'generated_by_item': [0 for _ in range(len(dataset))],
+        'accepted_existing_by_item': [0 for _ in range(len(dataset))],
+        'candidate_slots_by_item': [[] for _ in range(len(dataset))],
         'waiting_list': [
             (item_idx, n)
             for n in range(n_samples)
@@ -1143,6 +1310,7 @@ def _default_generation_state(dataset, n_samples):
         ],
         'next_sample_index_by_item': [n_samples for _ in range(len(dataset))],
         'start_successes': 0,
+        'start_generated': 0,
         'remaining': n_samples * len(dataset),
     }
 
@@ -1164,6 +1332,12 @@ def apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name
     for item_idx, _ in sharded_waiting_list:
         assigned_by_item[item_idx] += 1
 
+    previous_slots_by_item = state.get('candidate_slots_by_item', [[] for _ in range(len(dataset))])
+    sharded_generated_by_item = [
+        sum(1 for slot in slots if int(slot) % total == index)
+        for slots in previous_slots_by_item
+    ]
+    previous_accepted_by_item = state.get('accepted_existing_by_item', [0 for _ in range(len(dataset))])
     base_next_sample_index = state.get(
         'next_sample_index_by_item',
         [n_samples for _ in range(len(dataset))],
@@ -1174,6 +1348,8 @@ def apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name
         'append_results': state.get('append_results', False),
         'goal_by_item': assigned_by_item,
         'successes_by_item': [0 for _ in range(len(dataset))],
+        'generated_by_item': sharded_generated_by_item,
+        'accepted_existing_by_item': previous_accepted_by_item,
         'waiting_list': sharded_waiting_list,
         'next_sample_index_by_item': [
             int(value) + index
@@ -1183,6 +1359,7 @@ def apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name
         'results_name': f'results.shard{index}of{total}.jsonl',
         'tmp_dir_name': f'tmp_shard{index}of{total}',
         'start_successes': 0,
+        'start_generated': sum(sharded_generated_by_item),
         'remaining': sum(assigned_by_item),
     })
     print_log(
@@ -1200,6 +1377,22 @@ def _shard_max_sampling(max_sampling, split_opt):
     total = split_opt['total']
     index = split_opt['index']
     return (int(max_sampling) + total - 1 - index) // total
+
+
+def _apply_remaining_sampling_budget(max_sampling, resume_state, resume_opt, split_opt, run_name):
+    remaining_budget = _resume_remaining_sampling_budget(resume_opt)
+    if remaining_budget is None:
+        return max_sampling
+    start_generated = int((resume_state or {}).get('start_generated', 0))
+    max_sampling = start_generated + remaining_budget
+    shard_note = ' for this shard' if split_opt.get('enabled', False) else ''
+    print_log(
+        f'Resume generation for {run_name}: remaining_sampling_budget={remaining_budget}'
+        f'{shard_note} overrides max_sampling_number; '
+        f'previous_candidates={start_generated}, effective_max_sampling={max_sampling}',
+        level='INFO',
+    )
+    return max_sampling
 
 
 def _resolve_prefetch_options(config, args):
@@ -1244,17 +1437,80 @@ def _generation_stats_path(save_dir, results_name):
     return Path(save_dir) / f'generation_stats{suffix}.json'
 
 
-def _write_generation_stats(stats_path, recorder, batches_generated, accepted_start):
+def _target_generation_stats(
+        recorder,
+        target_ids,
+        generated_start_by_item,
+        accepted_start_by_item,
+        accepted_existing_by_item,
+    ):
+    if target_ids is None:
+        return {}
+    per_target = {}
+    for item_idx, target_id in enumerate(target_ids):
+        generated_total = int(recorder.generated_by_item[item_idx])
+        generated_start = int(generated_start_by_item[item_idx])
+        accepted_control = int(recorder.successes_by_item[item_idx])
+        accepted_existing = int(accepted_existing_by_item[item_idx])
+        accepted_total = max(accepted_existing, accepted_control)
+        accepted_start = max(accepted_existing, int(accepted_start_by_item[item_idx]))
+        accepted_this_run = max(0, accepted_total - accepted_start)
+        generated_this_run = max(0, generated_total - generated_start)
+        per_target[target_id] = {
+            'generated_candidates': generated_total,
+            'generated_candidates_this_run': generated_this_run,
+            'accepted': accepted_total,
+            'accepted_this_run': accepted_this_run,
+            'goal': int(recorder.goal_by_item[item_idx]),
+            'remaining': max(0, int(recorder.goal_by_item[item_idx]) - accepted_control),
+            'success_rate': accepted_total / generated_total if generated_total else 0.0,
+            'success_rate_this_run': accepted_this_run / generated_this_run if generated_this_run else 0.0,
+        }
+    return per_target
+
+
+def _write_generation_stats(
+        stats_path,
+        recorder,
+        batches_generated,
+        accepted_start,
+        generated_start=0,
+        target_ids=None,
+        generated_start_by_item=None,
+        accepted_start_by_item=None,
+        accepted_existing_by_item=None,
+    ):
     generated = int(recorder.num_generated)
+    generated_this_run = max(0, generated - int(generated_start))
     accepted = int(recorder.num_successful - accepted_start)
+    if generated_start_by_item is None:
+        generated_start_by_item = [0 for _ in range(recorder.num_items)]
+    if accepted_start_by_item is None:
+        accepted_start_by_item = [0 for _ in range(recorder.num_items)]
+    if accepted_existing_by_item is None:
+        accepted_existing_by_item = [0 for _ in range(recorder.num_items)]
+    per_target = _target_generation_stats(
+        recorder,
+        target_ids,
+        generated_start_by_item,
+        accepted_start_by_item,
+        accepted_existing_by_item,
+    )
+    accepted_total = (
+        sum(item['accepted'] for item in per_target.values())
+        if per_target else int(recorder.num_successful)
+    )
     stats = {
         'batches_generated': int(batches_generated),
         'generated_candidates': generated,
+        'generated_candidates_this_run': generated_this_run,
         'failed_candidates': int(recorder.num_failed),
         'accepted': accepted,
-        'accepted_total': int(recorder.num_successful),
+        'accepted_total': int(accepted_total),
         'target_total': int(recorder.total),
-        'accept_rate': accepted / generated if generated else 0.0,
+        'accept_rate': accepted_total / generated if generated else 0.0,
+        'accept_rate_this_run': accepted / generated_this_run if generated_this_run else 0.0,
+        'per_target': per_target,
     }
     stats_path = Path(stats_path)
     tmp_path = stats_path.with_suffix(stats_path.suffix + '.tmp')
@@ -1263,11 +1519,32 @@ def _write_generation_stats(stats_path, recorder, batches_generated, accepted_st
     return stats
 
 
-def _report_generation_progress(stats_path, recorder, batches_generated, accepted_start):
-    stats = _write_generation_stats(stats_path, recorder, batches_generated, accepted_start)
+def _report_generation_progress(
+        stats_path,
+        recorder,
+        batches_generated,
+        accepted_start,
+        generated_start=0,
+        target_ids=None,
+        generated_start_by_item=None,
+        accepted_start_by_item=None,
+        accepted_existing_by_item=None,
+    ):
+    stats = _write_generation_stats(
+        stats_path,
+        recorder,
+        batches_generated,
+        accepted_start,
+        generated_start=generated_start,
+        target_ids=target_ids,
+        generated_start_by_item=generated_start_by_item,
+        accepted_start_by_item=accepted_start_by_item,
+        accepted_existing_by_item=accepted_existing_by_item,
+    )
     message = (
         f'{stats["batches_generated"]} batches generated '
-        f'({stats["generated_candidates"]} designs in total), '
+        f'({stats["generated_candidates_this_run"]} designs this run, '
+        f'{stats["generated_candidates"]} designs in total), '
         f'{stats["accepted"]} accepted'
     )
     if accepted_start:
@@ -1591,11 +1868,28 @@ def generate_for_one_template(
         sample_index_stride=resume_state.get('sample_index_stride', 1),
         results_name=resume_state.get('results_name', 'results.jsonl'),
         append=resume_state.get('append_results', False),
+        start_generated=resume_state.get('start_generated', 0),
+        generated_by_item=resume_state.get('generated_by_item', None),
     )
     accepted_index = int(resume_state.get('accepted_start_index', 1))
     accepted_index_stride = int(resume_state.get('accepted_index_stride', 1))
     accepted_start = int(recorder.num_successful)
+    generated_start = int(recorder.num_generated)
+    target_ids = _dataset_item_target_ids(dataset)
+    accepted_start_by_item = list(recorder.successes_by_item)
+    generated_start_by_item = list(recorder.generated_by_item)
+    accepted_existing_by_item = list(resume_state.get(
+        'accepted_existing_by_item',
+        accepted_start_by_item,
+    ))
     batches_generated = 0
+    if max_sampling is not None and generated_start:
+        remaining_attempt_budget = max(0, int(max_sampling) - generated_start)
+        print_log(
+            f'Resume max_sampling accounting: previous_candidates={generated_start}, '
+            f'max_sampling={int(max_sampling)}, remaining_attempt_budget={remaining_attempt_budget}',
+            level='INFO',
+        )
     stats_path = _generation_stats_path(save_dir, resume_state.get('results_name', 'results.jsonl'))
     tmp_save_dir = os.path.join(save_dir, resume_state.get('tmp_dir_name', 'tmp'))
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
@@ -1723,7 +2017,17 @@ def generate_for_one_template(
                                 log = None
                         recorder.check_and_save(log, item_idx, n)
 
-                    _report_generation_progress(stats_path, recorder, batches_generated, accepted_start)
+                    _report_generation_progress(
+                        stats_path,
+                        recorder,
+                        batches_generated,
+                        accepted_start,
+                        generated_start=generated_start,
+                        target_ids=target_ids,
+                        generated_start_by_item=generated_start_by_item,
+                        accepted_start_by_item=accepted_start_by_item,
+                        accepted_existing_by_item=accepted_existing_by_item,
+                    )
                     continue
 
                 vae_batch_list = []
@@ -1833,13 +2137,37 @@ def generate_for_one_template(
                             data['cplx_desc'] = cplx_desc
                             vae_batch_list.append(data)
 
-                _report_generation_progress(stats_path, recorder, batches_generated, accepted_start)
+                _report_generation_progress(
+                    stats_path,
+                    recorder,
+                    batches_generated,
+                    accepted_start,
+                    generated_start=generated_start,
+                    target_ids=target_ids,
+                    generated_start_by_item=generated_start_by_item,
+                    accepted_start_by_item=accepted_start_by_item,
+                    accepted_existing_by_item=accepted_existing_by_item,
+                )
     finally:
         if postprocess_executor is not None:
             postprocess_executor.shutdown(wait=True, cancel_futures=True)
 
-    if recorder.num_generated:
-        print_log(f'Failed rate: {recorder.num_failed / recorder.num_generated}', level='DEBUG')
+    if batches_generated == 0:
+        _report_generation_progress(
+            stats_path,
+            recorder,
+            batches_generated,
+            accepted_start,
+            generated_start=generated_start,
+            target_ids=target_ids,
+            generated_start_by_item=generated_start_by_item,
+            accepted_start_by_item=accepted_start_by_item,
+            accepted_existing_by_item=accepted_existing_by_item,
+        )
+
+    current_generated = recorder.num_generated - generated_start
+    if current_generated:
+        print_log(f'Failed rate: {recorder.num_failed / current_generated}', level='DEBUG')
     if os.path.exists(tmp_save_dir):
         shutil.rmtree(tmp_save_dir)
     if accepted_tmp_dir.exists():
@@ -1990,6 +2318,13 @@ def main(args, opt_args):
             )
             resume_state = apply_generation_shard(resume_state, split_opt, dataset, n_samples, run_name)
             max_sampling_for_run = _shard_max_sampling(max_sampling, split_opt)
+            max_sampling_for_run = _apply_remaining_sampling_budget(
+                max_sampling_for_run,
+                resume_state,
+                resume_opt,
+                split_opt,
+                run_name,
+            )
             print_log(
                 f'Accepted pipeline enabled: goal={n_samples * n_inputs}, '
                 f'max_sampling={max_sampling_for_run if max_sampling_for_run is not None else "unlimited"}',

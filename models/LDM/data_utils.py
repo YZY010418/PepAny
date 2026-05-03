@@ -266,6 +266,8 @@ class Recorder:
             sample_index_stride=1,
             results_name='results.jsonl',
             append=False,
+            start_generated=0,
+            generated_by_item=None,
         ):
         self.n_samples = int(n_samples)
         self.num_items = len(test_set)
@@ -295,7 +297,13 @@ class Recorder:
         self.waiting_list = [(int(i), int(n)) for i, n in waiting_list]
         self.required_slots = set(self.waiting_list)
         self.keep_full_batches = bool(keep_full_batches)
-        self.num_generated, self.num_failed = 0, 0
+        self.num_generated, self.num_failed = int(start_generated), 0
+        self.generated_by_item = (
+            [0 for _ in range(self.num_items)]
+            if generated_by_item is None else [int(value) for value in generated_by_item]
+        )
+        if len(self.generated_by_item) != self.num_items:
+            raise ValueError('generated_by_item must have one entry per dataset item')
         self.max_generated = None if max_generated is None else int(max_generated)
         if next_sample_index_by_item is None:
             next_sample_index_by_item = [self.n_samples for _ in range(self.num_items)]
@@ -359,6 +367,7 @@ class Recorder:
 
     def check_and_save(self, log, item_idx, n, struct_only=False):
         self.num_generated += 1
+        self.generated_by_item[item_idx] += 1
         slot = (int(item_idx), int(n))
         if log is None:
             if self.accepts_more(item_idx):
