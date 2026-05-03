@@ -44,8 +44,17 @@ def _bond_type_from_cif_order(order_str: Optional[str]):
 def _bond_type_from_biotite(bond):
     if BiotiteBondType is None:
         return BondType.NONE
-    biotite_bond = bond if isinstance(bond, BiotiteBondType) else BiotiteBondType(bond)
-    return BondType(biotite_bond.without_aromaticity().value)
+    if isinstance(bond, BondType):
+        return bond
+    if isinstance(bond, str):
+        bond_type_value = _bond_type_from_cif_order(bond)
+        return BondType.NONE if bond_type_value is None else BondType(bond_type_value)
+    try:
+        biotite_bond = bond if isinstance(bond, BiotiteBondType) else BiotiteBondType(bond)
+        return BondType(biotite_bond.without_aromaticity().value)
+    except Exception:
+        bond_type_value = _bond_type_from_cif_order(str(bond))
+        return BondType.NONE if bond_type_value is None else BondType(bond_type_value)
 
 
 def _normalize_ins_code(ins_code: Optional[str]) -> str:

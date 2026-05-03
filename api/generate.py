@@ -4,7 +4,12 @@ import os
 import shutil
 import argparse
 import csv
+import json
 import re
+import random
+import multiprocessing as mp
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 try:
     import fcntl
 except ImportError:
@@ -14,6 +19,7 @@ from pathlib import Path
 
 import yaml
 import torch
+import numpy as np
 from rdkit import Chem
 
 from data.bioparse.hierarchy import Atom, Block, Bond, BondType, Complex, Molecule
@@ -57,6 +63,8 @@ def parse():
     parser.add_argument('--seed', type=int, default=None, help='Random seed, overrides config seed')
     parser.add_argument('--num_shards', '--total_gpus', dest='num_shards', type=int, default=None, help='Total number of generation shards')
     parser.add_argument('--shard_id', '--worker_id', dest='shard_id', type=int, default=None, help='Index of this generation shard, from 0 to num_shards - 1')
+    parser.add_argument('--num_workers', type=int, default=None, help='CPU workers for generation batch prefetch, overrides config num_workers')
+    parser.add_argument('--postprocess_workers', type=int, default=None, help='CPU workers for candidate post-processing, overrides config generation_postprocess.num_workers')
     parser.add_argument('--n_cpus', type=int, default=4, help='Number of CPU to use (for parallelly saving the generated results)')
     return parser.parse_known_args()
 
@@ -72,6 +80,174 @@ def to_device(data, device):
     elif hasattr(data, 'to'):
         data = data.to(device)
     return data
+
+
+_PREFETCH_DATASET = None
+
+
+def _init_batch_prefetch_worker(dataset, torch_num_threads):
+    global _PREFETCH_DATASET
+    _PREFETCH_DATASET = dataset
+    if torch_num_threads is not None:
+        torch.set_num_threads(int(torch_num_threads))
+
+
+def _setup_prefetch_seed(seed):
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (2 ** 32))
+    torch.manual_seed(int(seed))
+
+
+def _collate_batch_worker(task):
+    batch_list, task_seed = task
+    if task_seed is not None:
+        _setup_prefetch_seed(task_seed)
+    return batch_list, _PREFETCH_DATASET.collate_fn([
+        _PREFETCH_DATASET[i]
+        for i, _ in batch_list
+    ])
+
+
+def _init_postprocess_worker(torch_num_threads):
+    if torch_num_threads is not None:
+        torch.set_num_threads(int(torch_num_threads))
+
+
+class BatchPrefetcher:
+
+    def __init__(
+            self,
+            dataset,
+            recorder,
+            batch_size,
+            num_workers=0,
+            prefetch_batches=2,
+            backend='process',
+            start_method='spawn',
+            seed=None,
+            torch_num_threads=1,
+        ):
+        self.dataset = dataset
+        self.recorder = recorder
+        self.batch_size = int(batch_size)
+        self.num_workers = int(num_workers)
+        self.prefetch_batches = max(1, int(prefetch_batches))
+        self.backend = str(backend).lower()
+        self.start_method = str(start_method)
+        self.seed = seed
+        self.torch_num_threads = torch_num_threads
+        self.executor = None
+        self.pending = deque()
+        self.task_index = 0
+
+    def __enter__(self):
+        if self.num_workers > 0:
+            if self.backend == 'thread':
+                self.executor = ThreadPoolExecutor(
+                    max_workers=self.num_workers,
+                    initializer=_init_batch_prefetch_worker,
+                    initargs=(self.dataset, None),
+                )
+            elif self.backend == 'process':
+                mp_context = mp.get_context(self.start_method)
+                self.executor = ProcessPoolExecutor(
+                    max_workers=self.num_workers,
+                    initializer=_init_batch_prefetch_worker,
+                    initargs=(self.dataset, self.torch_num_threads),
+                    mp_context=mp_context,
+                )
+            else:
+                raise ValueError('generation prefetch backend must be "process" or "thread"')
+            self._fill()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._shutdown_executor()
+
+    def _shutdown_executor(self):
+        if self.executor is not None:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = None
+
+    def _next_seed(self):
+        if self.seed is None:
+            return None
+        return int(self.seed) + self.task_index * 1000003
+
+    def _prepare_serial(self, batch_list, task_seed=None):
+        if task_seed is not None:
+            setup_seed(int(task_seed))
+        return batch_list, self.dataset.collate_fn([
+            self.dataset[i]
+            for i, _ in batch_list
+        ])
+
+    def _submit_next(self):
+        if self.recorder.is_finished():
+            return False
+        batch_list = self.recorder.get_next_batch_list(self.batch_size)
+        if not batch_list:
+            return False
+        task_seed = self._next_seed() if self.backend == 'process' and self.executor is not None else None
+        self.task_index += 1
+        if self.executor is None:
+            self.pending.append(('ready', batch_list, self._prepare_serial(batch_list, task_seed)))
+        else:
+            try:
+                self.pending.append((
+                    'future',
+                    batch_list,
+                    self.executor.submit(
+                        _collate_batch_worker,
+                        (batch_list, task_seed),
+                    ),
+                ))
+            except Exception as exc:
+                print_log(
+                    f'Generation prefetch worker submission failed; '
+                    f'falling back to serial batch preparation: {exc}',
+                    level='WARN',
+                )
+                self._shutdown_executor()
+                self.pending.append(('ready', batch_list, self._prepare_serial(batch_list)))
+        return True
+
+    def _fill(self):
+        while len(self.pending) < self.prefetch_batches:
+            if not self._submit_next():
+                break
+
+    def next(self):
+        if self.executor is None:
+            if not self.pending:
+                self._submit_next()
+            if not self.pending:
+                raise StopIteration
+            kind, batch_list, payload = self.pending.popleft()
+            if kind == 'ready':
+                return payload
+            return self._prepare_serial(batch_list)
+
+        self._fill()
+        if not self.pending:
+            raise StopIteration
+        kind, batch_list, payload = self.pending.popleft()
+        if kind == 'ready':
+            return payload
+        future = payload
+        try:
+            result = future.result()
+        except Exception as exc:
+            print_log(
+                f'Generation batch prefetch failed; falling back to serial batch '
+                f'preparation. Original error: {exc}',
+                level='WARN',
+            )
+            self._shutdown_executor()
+            result = self._prepare_serial(batch_list)
+        if self.executor is not None:
+            self._fill()
+        return result
 
 
 def data_to_cplx(cplx_desc: ComplexDesc, template: BaseTemplate, S: list, X: list, A: list, ll: list, inter_bonds: tuple, intra_bonds: tuple, out_path: str, check_validity: bool=False, check_filters: bool=False):
@@ -864,12 +1040,15 @@ def _sanitize_pipeline_accepted_dir_unlocked(accepted_dir, lig_chains, sanitize_
             cplx = cif_to_complex(str(cif_path), selected_chains=lig_chains)
             violations = find_ligand_amide_bond_violations(cplx, lig_chains, max_distance)
         except Exception as exc:
-            violations = [{'error': str(exc)}]
+            print_log(
+                f'Sanitize generation: keeping {Path(cif_path).name}; '
+                f'could not parse/check CIF: {exc}',
+                level='WARN',
+            )
+            kept.append({'row': row, 'cif_path': Path(cif_path)})
+            continue
         if violations:
-            if 'error' in violations[0]:
-                reason = f'parse/check error: {violations[0]["error"]}'
-            else:
-                reason = '; '.join(_format_ligand_amide_violation(item) for item in violations[:3])
+            reason = '; '.join(_format_ligand_amide_violation(item) for item in violations[:3])
             removed.append((Path(cif_path), reason))
             continue
         kept.append({'row': row, 'cif_path': Path(cif_path)})
@@ -1023,6 +1202,250 @@ def _shard_max_sampling(max_sampling, split_opt):
     return (int(max_sampling) + total - 1 - index) // total
 
 
+def _resolve_prefetch_options(config, args):
+    prefetch_opt = dict(config.get('generation_prefetch', {}) or {})
+    if 'num_workers' not in prefetch_opt:
+        prefetch_opt['num_workers'] = config.get('num_workers', 0)
+    if args.num_workers is not None:
+        prefetch_opt['num_workers'] = args.num_workers
+    prefetch_opt.setdefault('prefetch_batches', config.get('prefetch_batches', 2))
+    prefetch_opt.setdefault('backend', 'thread')
+    prefetch_opt.setdefault('start_method', 'spawn')
+    prefetch_opt.setdefault('torch_num_threads', 1)
+    prefetch_opt['num_workers'] = int(prefetch_opt.get('num_workers', 0))
+    prefetch_opt['prefetch_batches'] = int(prefetch_opt.get('prefetch_batches', 2))
+    prefetch_opt['backend'] = str(prefetch_opt.get('backend', 'thread')).lower()
+    if prefetch_opt['backend'] == 'process' and not bool(prefetch_opt.get('allow_process_backend', False)):
+        print_log(
+            'generation_prefetch.backend=process was requested, but process prefetch '
+            'can terminate GPU jobs on large datasets because every spawned worker '
+            'needs its own Python/dataset state. Using backend=thread instead. '
+            'Set generation_prefetch.allow_process_backend=true to force process mode.',
+            level='WARN',
+        )
+        prefetch_opt['backend'] = 'thread'
+    if prefetch_opt['num_workers'] < 0:
+        raise ValueError('generation_prefetch.num_workers must be >= 0')
+    if prefetch_opt['prefetch_batches'] <= 0:
+        raise ValueError('generation_prefetch.prefetch_batches must be positive')
+    if prefetch_opt['backend'] not in {'process', 'thread'}:
+        raise ValueError('generation_prefetch.backend must be "process" or "thread"')
+    return prefetch_opt
+
+
+def _uses_without_replacement_sampler(dataset):
+    sampler = getattr(getattr(dataset, 'config', None), 'term_rel_pos_sampler', None)
+    return sampler is not None and not getattr(sampler, 'sample_with_replacement', True)
+
+
+def _generation_stats_path(save_dir, results_name):
+    stem = Path(results_name).stem
+    suffix = '' if stem == 'results' else stem[len('results'):] if stem.startswith('results') else f'.{stem}'
+    return Path(save_dir) / f'generation_stats{suffix}.json'
+
+
+def _write_generation_stats(stats_path, recorder, batches_generated, accepted_start):
+    generated = int(recorder.num_generated)
+    accepted = int(recorder.num_successful - accepted_start)
+    stats = {
+        'batches_generated': int(batches_generated),
+        'generated_candidates': generated,
+        'failed_candidates': int(recorder.num_failed),
+        'accepted': accepted,
+        'accepted_total': int(recorder.num_successful),
+        'target_total': int(recorder.total),
+        'accept_rate': accepted / generated if generated else 0.0,
+    }
+    stats_path = Path(stats_path)
+    tmp_path = stats_path.with_suffix(stats_path.suffix + '.tmp')
+    tmp_path.write_text(json.dumps(stats, indent=2) + '\n')
+    os.replace(tmp_path, stats_path)
+    return stats
+
+
+def _report_generation_progress(stats_path, recorder, batches_generated, accepted_start):
+    stats = _write_generation_stats(stats_path, recorder, batches_generated, accepted_start)
+    message = (
+        f'{stats["batches_generated"]} batches generated '
+        f'({stats["generated_candidates"]} designs in total), '
+        f'{stats["accepted"]} accepted'
+    )
+    if accepted_start:
+        message += f' this run ({stats["accepted_total"]}/{stats["target_total"]} total accepted)'
+    message += f', accept_rate={stats["accept_rate"]:.4f}'
+    print_log(message, level='INFO')
+
+
+def _resolve_postprocess_options(config, args):
+    postprocess_opt = dict(config.get('generation_postprocess', {}) or {})
+    if 'num_workers' not in postprocess_opt:
+        postprocess_opt['num_workers'] = config.get('postprocess_workers', 0)
+    if args.postprocess_workers is not None:
+        postprocess_opt['num_workers'] = args.postprocess_workers
+    postprocess_opt.setdefault('backend', 'process')
+    postprocess_opt.setdefault('start_method', 'spawn')
+    postprocess_opt.setdefault('torch_num_threads', 1)
+    postprocess_opt['num_workers'] = int(postprocess_opt.get('num_workers', 0))
+    postprocess_opt['backend'] = str(postprocess_opt.get('backend', 'process')).lower()
+    if postprocess_opt['num_workers'] < 0:
+        raise ValueError('generation_postprocess.num_workers must be >= 0')
+    if postprocess_opt['backend'] not in {'process', 'thread'}:
+        raise ValueError('generation_postprocess.backend must be "process" or "thread"')
+    return postprocess_opt
+
+
+def _make_postprocess_executor(postprocess_opt):
+    num_workers = int(postprocess_opt.get('num_workers', 0))
+    if num_workers <= 0:
+        return None
+    backend = str(postprocess_opt.get('backend', 'process')).lower()
+    torch_num_threads = postprocess_opt.get('torch_num_threads', 1)
+    if backend == 'thread':
+        return ThreadPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_postprocess_worker,
+            initargs=(torch_num_threads,),
+        )
+    mp_context = mp.get_context(postprocess_opt.get('start_method', 'spawn'))
+    return ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=_init_postprocess_worker,
+        initargs=(torch_num_threads,),
+        mp_context=mp_context,
+    )
+
+
+def _pipeline_tmp_dir(accepted_dir, resume_state):
+    tmp_dir_name = resume_state.get('tmp_dir_name', 'tmp')
+    return Path(accepted_dir) / f'.postprocess_{tmp_dir_name}'
+
+
+def _cleanup_pipeline_temp(log):
+    if not log:
+        return
+    for key in ('accepted_cif', 'merged_sdf'):
+        path = log.get(key, '')
+        if path:
+            path = Path(path)
+            if path.exists():
+                path.unlink()
+
+
+def _finalize_pipeline_temp(log, accepted_dir, accepted_index):
+    accepted_dir = Path(accepted_dir)
+    temp_cif = Path(log.get('accepted_cif', ''))
+    if not temp_cif.exists():
+        raise FileNotFoundError(f'Accepted pipeline temp CIF does not exist: {temp_cif}')
+
+    accepted_name = f'accepted_{accepted_index}'
+    final_cif = accepted_dir / f'{accepted_name}.cif'
+    shutil.move(str(temp_cif), str(final_cif))
+    log['accepted_name'] = accepted_name
+    log['accepted_cif'] = str(final_cif)
+
+    temp_sdf_value = log.get('merged_sdf', '')
+    if temp_sdf_value:
+        temp_sdf = Path(temp_sdf_value)
+        if temp_sdf.exists():
+            final_sdf = accepted_dir / f'{accepted_name}.sdf'
+            shutil.move(str(temp_sdf), str(final_sdf))
+            log['merged_sdf'] = str(final_sdf)
+
+    append_pipeline_metadata(accepted_dir, {
+        **log,
+        'id': log.get('id', ''),
+        'sample_slot': log.get('n', ''),
+    })
+    return log
+
+
+def _postprocess_candidate_worker(task):
+    item_idx = task['item_idx']
+    n = task['n']
+    cplx_desc = task['cplx_desc']
+    try:
+        tmp_target_dir = task['tmp_target_dir']
+        target_dir = task['target_dir']
+        pocket_path = task['pocket_path']
+        os.makedirs(tmp_target_dir, exist_ok=True)
+        os.makedirs(target_dir, exist_ok=True)
+        if task.get('write_pocket', False) and not os.path.exists(pocket_path):
+            complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
+
+        cplx_desc, details = data_to_cplx(
+            cplx_desc,
+            task['template_config'],
+            task['S'],
+            task['X'],
+            task['A'],
+            task['ll'],
+            task['inter_bonds'],
+            task['intra_bonds'],
+            task['out_path'],
+            check_validity=task.get('check_validity', False),
+            check_filters=task.get('check_filters', False),
+        )
+        if cplx_desc is None:
+            return {'item_idx': item_idx, 'n': n, 'log': None}
+
+        if task.get('final_cycle', True):
+            details = reject_implausible_ligand_amides(
+                cplx_desc,
+                details,
+                n,
+                task.get('amide_check_opt', {}),
+            )
+
+        if details is not None and task.get('pipeline_enabled', False):
+            try:
+                temp_name = f'tmp_{os.getpid()}_{item_idx}_{n}'
+                details = run_terminal_merge_pipeline(
+                    cplx_desc,
+                    details,
+                    n,
+                    task['out_path'],
+                    task['out_path'].rstrip('.pdb') + '.sdf',
+                    task['accepted_tmp_dir'],
+                    task.get('pipeline_opt', {}),
+                    accepted_name=temp_name,
+                    append_metadata_row=False,
+                )
+            except Exception as exc:
+                details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
+        elif details is not None and task.get('final_cycle', True):
+            details = add_terminal_rmsd_details(
+                cplx_desc,
+                details,
+                task['out_path'].rstrip('.pdb') + '.sdf',
+                task.get('pipeline_opt', {}),
+            )
+
+        log = None if details is None else format_log(cplx_desc, details, n)
+        return {'item_idx': item_idx, 'n': n, 'log': log}
+    except Exception as exc:
+        print_log(f'Post-processing failed for {cplx_desc.id}/{n}: {exc}', level='WARN')
+        return {'item_idx': item_idx, 'n': n, 'log': None}
+
+
+def _run_postprocess_tasks(tasks, executor):
+    if executor is None:
+        return [_postprocess_candidate_worker(task) for task in tasks]
+
+    futures = [executor.submit(_postprocess_candidate_worker, task) for task in tasks]
+    results = []
+    for task, future in zip(tasks, futures):
+        try:
+            results.append(future.result())
+        except Exception as exc:
+            print_log(
+                f'Post-processing worker crashed for item={task["item_idx"]}, '
+                f'n={task["n"]}; falling back to serial post-processing: {exc}',
+                level='WARN',
+            )
+            results.append(_postprocess_candidate_worker(task))
+    return results
+
+
 def run_terminal_merge_pipeline(
         cplx_desc,
         details,
@@ -1031,7 +1454,9 @@ def run_terminal_merge_pipeline(
         raw_sdf_path,
         accepted_dir,
         pipeline_opt,
-        accepted_index,
+        accepted_index=None,
+        accepted_name=None,
+        append_metadata_row=True,
     ):
     control = cplx_desc.control or {}
     rmsd_details = compute_terminal_rmsd_details(cplx_desc, raw_sdf_path, pipeline_opt)
@@ -1084,7 +1509,8 @@ def run_terminal_merge_pipeline(
     residue_name = pipeline_opt.get('ligand_residue_name', 'CAP')
     accepted_dir = Path(accepted_dir)
     accepted_dir.mkdir(parents=True, exist_ok=True)
-    accepted_name = f'accepted_{accepted_index}'
+    if accepted_name is None:
+        accepted_name = f'accepted_{accepted_index}'
     cif_path = accepted_dir / f'{accepted_name}.cif'
     merged_cplx = merged_complex_with_cap_residue(
         cplx_desc,
@@ -1118,11 +1544,12 @@ def run_terminal_merge_pipeline(
         'merged_sdf': merged_sdf_path,
         'merge_status': 'saved',
     })
-    append_pipeline_metadata(accepted_dir, {
-        **details,
-        'id': cplx_desc.id,
-        'sample_slot': n,
-    })
+    if append_metadata_row:
+        append_pipeline_metadata(accepted_dir, {
+            **details,
+            'id': cplx_desc.id,
+            'sample_slot': n,
+        })
     return details
 
 
@@ -1138,10 +1565,15 @@ def generate_for_one_template(
         max_sampling=None,
         resume_state=None,
         amide_check_opt=None,
+        prefetch_opt=None,
+        prefetch_seed=None,
+        postprocess_opt=None,
     ):
     pipeline_opt = {} if pipeline_opt is None else dict(pipeline_opt)
     resume_state = {} if resume_state is None else dict(resume_state)
     amide_check_opt = {} if amide_check_opt is None else dict(amide_check_opt)
+    prefetch_opt = {} if prefetch_opt is None else dict(prefetch_opt)
+    postprocess_opt = {} if postprocess_opt is None else dict(postprocess_opt)
     accepted_dir = resolve_pipeline_accepted_dir(save_dir, pipeline_opt)
     if _option_enabled(pipeline_opt):
         os.makedirs(accepted_dir, exist_ok=True)
@@ -1162,158 +1594,256 @@ def generate_for_one_template(
     )
     accepted_index = int(resume_state.get('accepted_start_index', 1))
     accepted_index_stride = int(resume_state.get('accepted_index_stride', 1))
+    accepted_start = int(recorder.num_successful)
+    batches_generated = 0
+    stats_path = _generation_stats_path(save_dir, resume_state.get('results_name', 'results.jsonl'))
     tmp_save_dir = os.path.join(save_dir, resume_state.get('tmp_dir_name', 'tmp'))
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
-    
-    while not recorder.is_finished():
-        batch_list = recorder.get_next_batch_list(batch_size)
-        batch = dataset.collate_fn([dataset[i] for i, _ in batch_list])
-        
-        with torch.no_grad():
-            cplx_descs = batch.pop('cplx_desc')
-            # to GPU
-            batch = to_device(batch, device)
-            # inference
-            batch_S, batch_X, batch_A, batch_ll, batch_inter_bonds, batch_intra_bonds = model.sample(sample_opt=sample_opt, **batch)
+    accepted_tmp_dir = _pipeline_tmp_dir(accepted_dir, resume_state)
 
-        vae_batch_list = []
-        for i in range(len(cplx_descs)):
-            S, X, A, ll = batch_S[i], batch_X[i], batch_A[i], batch_ll[i]
-            inter_bonds, intra_bonds = batch_inter_bonds[i], batch_intra_bonds[i]
-            item_idx, n = batch_list[i]
-            cplx_desc = cplx_descs[i]
+    prefetch_num_workers = int(prefetch_opt.get('num_workers', 0))
+    if max_sampling is not None and prefetch_num_workers > 0:
+        print_log(
+            'Generation prefetch disabled because max_sampling is set; '
+            'this preserves the exact attempt limit.',
+            level='WARN',
+        )
+        prefetch_num_workers = 0
+    if _uses_without_replacement_sampler(dataset) and prefetch_num_workers > 1:
+        print_log(
+            'Generation prefetch workers reduced to 1 because term_rel_pos_sdf '
+            'uses sampling without replacement.',
+            level='WARN',
+        )
+        prefetch_num_workers = 1
+    if prefetch_num_workers > 0:
+        print_log(
+            f'Generation prefetch enabled: workers={prefetch_num_workers}, '
+            f'prefetch_batches={prefetch_opt.get("prefetch_batches", 2)}, '
+            f'backend={prefetch_opt.get("backend", "process")}',
+            level='INFO',
+        )
 
-            tmp_target_dir = os.path.join(tmp_save_dir, cplx_desc.id)
-            target_dir = os.path.join(save_dir, cplx_desc.id)
-            pocket_path = os.path.join(tmp_target_dir, 'pocket.pdb')
-            os.makedirs(tmp_target_dir, exist_ok=True)
-            os.makedirs(target_dir, exist_ok=True)
-            if n == 0 or not os.path.exists(pocket_path):
-                complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
+    postprocess_num_workers = int(postprocess_opt.get('num_workers', 0))
+    if n_cycles != 0 and postprocess_num_workers > 0:
+        print_log(
+            'Generation postprocess workers disabled for Molecule templates because '
+            'autoencoder refinement cycles are sequential.',
+            level='WARN',
+        )
+        postprocess_num_workers = 0
+    if postprocess_num_workers > 0:
+        if _option_enabled(pipeline_opt):
+            accepted_tmp_dir.mkdir(parents=True, exist_ok=True)
+        print_log(
+            f'Generation postprocess enabled: workers={postprocess_num_workers}, '
+            f'backend={postprocess_opt.get("backend", "process")}',
+            level='INFO',
+        )
+    postprocess_run_opt = dict(postprocess_opt)
+    postprocess_run_opt['num_workers'] = postprocess_num_workers
+    postprocess_executor = _make_postprocess_executor(postprocess_run_opt)
 
-            if n_cycles == 0: out_path = os.path.join(save_dir, cplx_desc.id, str(n) + '.pdb')
-            else: out_path = os.path.join(tmp_save_dir, cplx_desc.id, str(n) + '.pdb')
-            cplx_desc, details = data_to_cplx(
-                cplx_desc, dataset.config, S, X, A, ll, inter_bonds, intra_bonds, out_path,
-                check_validity = dataset.config.name == 'Molecule' and (n_cycles == 0),
-                check_filters = (n_cycles == 0)
-            )
-            if cplx_desc is None:
-                log = None
-                assert n_cycles == 0  # only the last cycle has such possibility
-            else:
-                details = reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt)
-                if details is not None and n_cycles == 0 and _option_enabled(pipeline_opt):
-                    try:
-                        if recorder.accepts_more(item_idx):
-                            details = run_terminal_merge_pipeline(
-                                cplx_desc,
-                                details,
-                                n,
-                                out_path,
-                                out_path.rstrip('.pdb') + '.sdf',
-                                accepted_dir,
-                                pipeline_opt,
-                                accepted_index,
-                            )
-                        else:
-                            details = None
-                    except Exception as exc:
-                        details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
-                    if details is not None:
-                        accepted_index += accepted_index_stride
-                elif details is not None and n_cycles == 0:
-                    details = add_terminal_rmsd_details(
-                        cplx_desc,
-                        details,
-                        out_path.rstrip('.pdb') + '.sdf',
-                        pipeline_opt,
+    try:
+        with BatchPrefetcher(
+            dataset=dataset,
+            recorder=recorder,
+            batch_size=batch_size,
+            num_workers=prefetch_num_workers,
+            prefetch_batches=prefetch_opt.get('prefetch_batches', 2),
+            backend=prefetch_opt.get('backend', 'process'),
+            start_method=prefetch_opt.get('start_method', 'spawn'),
+            seed=prefetch_seed,
+            torch_num_threads=prefetch_opt.get('torch_num_threads', 1),
+        ) as batch_prefetcher:
+            while not recorder.is_finished():
+                try:
+                    batch_list, batch = batch_prefetcher.next()
+                except StopIteration:
+                    break
+
+                with torch.no_grad():
+                    cplx_descs = batch.pop('cplx_desc')
+                    batch = to_device(batch, device)
+                    batch_S, batch_X, batch_A, batch_ll, batch_inter_bonds, batch_intra_bonds = model.sample(sample_opt=sample_opt, **batch)
+                    batches_generated += 1
+
+                if n_cycles == 0:
+                    tasks = []
+                    for i in range(len(cplx_descs)):
+                        item_idx, n = batch_list[i]
+                        cplx_desc = cplx_descs[i]
+                        tmp_target_dir = os.path.join(tmp_save_dir, cplx_desc.id)
+                        target_dir = os.path.join(save_dir, cplx_desc.id)
+                        pocket_path = os.path.join(tmp_target_dir, 'pocket.pdb')
+                        out_path = os.path.join(target_dir, str(n) + '.pdb')
+                        os.makedirs(tmp_target_dir, exist_ok=True)
+                        os.makedirs(target_dir, exist_ok=True)
+                        if n == 0 or not os.path.exists(pocket_path):
+                            complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
+
+                        tasks.append({
+                            'item_idx': item_idx,
+                            'n': n,
+                            'cplx_desc': cplx_desc,
+                            'template_config': dataset.config,
+                            'S': batch_S[i],
+                            'X': batch_X[i],
+                            'A': batch_A[i],
+                            'll': batch_ll[i],
+                            'inter_bonds': batch_inter_bonds[i],
+                            'intra_bonds': batch_intra_bonds[i],
+                            'tmp_target_dir': tmp_target_dir,
+                            'target_dir': target_dir,
+                            'pocket_path': pocket_path,
+                            'out_path': out_path,
+                            'check_validity': dataset.config.name == 'Molecule',
+                            'check_filters': True,
+                            'final_cycle': True,
+                            'amide_check_opt': amide_check_opt,
+                            'pipeline_opt': pipeline_opt,
+                            'pipeline_enabled': _option_enabled(pipeline_opt) and recorder.accepts_more(item_idx),
+                            'accepted_tmp_dir': str(accepted_tmp_dir),
+                        })
+
+                    for result in _run_postprocess_tasks(tasks, postprocess_executor):
+                        item_idx, n, log = result['item_idx'], result['n'], result['log']
+                        if _option_enabled(pipeline_opt):
+                            if log is not None and recorder.accepts_more(item_idx):
+                                try:
+                                    log = _finalize_pipeline_temp(log, accepted_dir, accepted_index)
+                                except Exception as exc:
+                                    print_log(f'Accepted pipeline finalize failed for item={item_idx}, n={n}: {exc}', level='WARN')
+                                    _cleanup_pipeline_temp(log)
+                                    log = None
+                                else:
+                                    accepted_index += accepted_index_stride
+                            elif log is not None:
+                                _cleanup_pipeline_temp(log)
+                                log = None
+                        recorder.check_and_save(log, item_idx, n)
+
+                    _report_generation_progress(stats_path, recorder, batches_generated, accepted_start)
+                    continue
+
+                vae_batch_list = []
+                for i in range(len(cplx_descs)):
+                    S, X, A, ll = batch_S[i], batch_X[i], batch_A[i], batch_ll[i]
+                    inter_bonds, intra_bonds = batch_inter_bonds[i], batch_intra_bonds[i]
+                    item_idx, n = batch_list[i]
+                    cplx_desc = cplx_descs[i]
+
+                    tmp_target_dir = os.path.join(tmp_save_dir, cplx_desc.id)
+                    target_dir = os.path.join(save_dir, cplx_desc.id)
+                    pocket_path = os.path.join(tmp_target_dir, 'pocket.pdb')
+                    os.makedirs(tmp_target_dir, exist_ok=True)
+                    os.makedirs(target_dir, exist_ok=True)
+                    if n == 0 or not os.path.exists(pocket_path):
+                        complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
+
+                    out_path = os.path.join(tmp_save_dir, cplx_desc.id, str(n) + '.pdb')
+                    cplx_desc, details = data_to_cplx(
+                        cplx_desc, dataset.config, S, X, A, ll, inter_bonds, intra_bonds, out_path,
+                        check_validity=False,
+                        check_filters=False,
                     )
-                log = None if details is None else format_log(cplx_desc, details, n)
-            
-            if n_cycles == 0: recorder.check_and_save(log, item_idx, n)
-            else:
-                data = _get_item(
-                    os.path.join(tmp_save_dir, cplx_desc.id, f'pocket.pdb'),
-                    out_path.rstrip('.pdb') + '.sdf',
-                    cplx_desc.tgt_chains
-                )
-                data['cplx_desc'] = cplx_desc
-                vae_batch_list.append(data)
+                    if cplx_desc is None:
+                        log = None
+                        assert n_cycles == 0
+                    else:
+                        log = None if details is None else format_log(cplx_desc, details, n)
 
-        model_autoencoder = model.autoencoder
-        for cyc_i in range(n_cycles):
-            print_log(f'Cycle: {cyc_i}', level='DEBUG')
-            final_cycle = cyc_i == n_cycles - 1
-            batch = dataset.collate_fn(vae_batch_list)
-            vae_batch_list = []
-            with torch.no_grad():
-                if final_cycle: batch['topo_generate_mask'] = torch.zeros_like(batch['generate_mask'])
-                cplx_descs = batch.pop('cplx_desc')
-                batch = to_device(batch, device)
-                batch_S, batch_X, batch_A, batch_ll, batch_inter_bonds, batch_intra_bonds = model_autoencoder.generate(**batch)
-            for i in range(len(cplx_descs)):
-                S, X, A, ll = batch_S[i], batch_X[i], batch_A[i], batch_ll[i]
-                inter_bonds, intra_bonds = batch_inter_bonds[i], batch_intra_bonds[i]
-                item_idx, n = batch_list[i]
-                cplx_desc = cplx_descs[i]
+                    if log is None:
+                        recorder.check_and_save(log, item_idx, n)
+                    else:
+                        data = _get_item(
+                            os.path.join(tmp_save_dir, cplx_desc.id, f'pocket.pdb'),
+                            out_path.rstrip('.pdb') + '.sdf',
+                            cplx_desc.tgt_chains
+                        )
+                        data['cplx_desc'] = cplx_desc
+                        vae_batch_list.append(data)
 
-                if final_cycle: out_path = os.path.join(save_dir, cplx_desc.id, str(n) + '.pdb')
-                else: out_path = os.path.join(tmp_save_dir, cplx_desc.id, f'{n}_cyc{cyc_i}.pdb')
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                cplx_desc, details = data_to_cplx(
-                    cplx_desc, dataset.config, S, X, A, ll, inter_bonds, intra_bonds, out_path,
-                    check_validity = dataset.config.name == 'Molecule' and final_cycle,
-                    check_filters = final_cycle
-                )
-                if cplx_desc is None:
-                    log = None
-                    assert final_cycle  # only the last cycle has such possibility
-                else:
-                    if final_cycle:
-                        details = reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt)
-                    if details is not None and final_cycle and _option_enabled(pipeline_opt):
-                        try:
-                            if recorder.accepts_more(item_idx):
-                                details = run_terminal_merge_pipeline(
+                model_autoencoder = model.autoencoder
+                for cyc_i in range(n_cycles):
+                    print_log(f'Cycle: {cyc_i}', level='DEBUG')
+                    final_cycle = cyc_i == n_cycles - 1
+                    batch = dataset.collate_fn(vae_batch_list)
+                    vae_batch_list = []
+                    with torch.no_grad():
+                        if final_cycle: batch['topo_generate_mask'] = torch.zeros_like(batch['generate_mask'])
+                        cplx_descs = batch.pop('cplx_desc')
+                        batch = to_device(batch, device)
+                        batch_S, batch_X, batch_A, batch_ll, batch_inter_bonds, batch_intra_bonds = model_autoencoder.generate(**batch)
+                    for i in range(len(cplx_descs)):
+                        S, X, A, ll = batch_S[i], batch_X[i], batch_A[i], batch_ll[i]
+                        inter_bonds, intra_bonds = batch_inter_bonds[i], batch_intra_bonds[i]
+                        item_idx, n = batch_list[i]
+                        cplx_desc = cplx_descs[i]
+
+                        if final_cycle: out_path = os.path.join(save_dir, cplx_desc.id, str(n) + '.pdb')
+                        else: out_path = os.path.join(tmp_save_dir, cplx_desc.id, f'{n}_cyc{cyc_i}.pdb')
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        cplx_desc, details = data_to_cplx(
+                            cplx_desc, dataset.config, S, X, A, ll, inter_bonds, intra_bonds, out_path,
+                            check_validity=dataset.config.name == 'Molecule' and final_cycle,
+                            check_filters=final_cycle,
+                        )
+                        if cplx_desc is None:
+                            log = None
+                            assert final_cycle
+                        else:
+                            if final_cycle:
+                                details = reject_implausible_ligand_amides(cplx_desc, details, n, amide_check_opt)
+                            if details is not None and final_cycle and _option_enabled(pipeline_opt):
+                                try:
+                                    if recorder.accepts_more(item_idx):
+                                        details = run_terminal_merge_pipeline(
+                                            cplx_desc,
+                                            details,
+                                            n,
+                                            out_path,
+                                            out_path.rstrip('.pdb') + '.sdf',
+                                            accepted_dir,
+                                            pipeline_opt,
+                                            accepted_index,
+                                        )
+                                    else:
+                                        details = None
+                                except Exception as exc:
+                                    details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
+                                if details is not None:
+                                    accepted_index += accepted_index_stride
+                            elif details is not None and final_cycle:
+                                details = add_terminal_rmsd_details(
                                     cplx_desc,
                                     details,
-                                    n,
-                                    out_path,
                                     out_path.rstrip('.pdb') + '.sdf',
-                                    accepted_dir,
                                     pipeline_opt,
-                                    accepted_index,
                                 )
-                            else:
-                                details = None
-                        except Exception as exc:
-                            details = _pipeline_reject(f'pipeline error: {exc}', cplx_desc, n)
-                        if details is not None:
-                            accepted_index += accepted_index_stride
-                    elif details is not None and final_cycle:
-                        details = add_terminal_rmsd_details(
-                            cplx_desc,
-                            details,
-                            out_path.rstrip('.pdb') + '.sdf',
-                            pipeline_opt,
-                        )
-                    log = None if details is None else format_log(cplx_desc, details, n)
+                            log = None if details is None else format_log(cplx_desc, details, n)
 
-                if final_cycle: recorder.check_and_save(log, item_idx, n)
-                else:
-                    data = _get_item(
-                        os.path.join(tmp_save_dir, cplx_desc.id, f'pocket.pdb'),
-                        out_path.rstrip('.pdb') + '.sdf',
-                        cplx_desc.tgt_chains
-                    )
-                    data['cplx_desc'] = cplx_desc
-                    vae_batch_list.append(data)
+                        if final_cycle: recorder.check_and_save(log, item_idx, n)
+                        else:
+                            data = _get_item(
+                                os.path.join(tmp_save_dir, cplx_desc.id, f'pocket.pdb'),
+                                out_path.rstrip('.pdb') + '.sdf',
+                                cplx_desc.tgt_chains
+                            )
+                            data['cplx_desc'] = cplx_desc
+                            vae_batch_list.append(data)
+
+                _report_generation_progress(stats_path, recorder, batches_generated, accepted_start)
+    finally:
+        if postprocess_executor is not None:
+            postprocess_executor.shutdown(wait=True, cancel_futures=True)
 
     if recorder.num_generated:
         print_log(f'Failed rate: {recorder.num_failed / recorder.num_generated}', level='DEBUG')
     if os.path.exists(tmp_save_dir):
         shutil.rmtree(tmp_save_dir)
+    if accepted_tmp_dir.exists():
+        shutil.rmtree(accepted_tmp_dir)
 
 
 def _template_run_name(template, template_idx, class_counts):
@@ -1325,6 +1855,24 @@ def _template_run_name(template, template_idx, class_counts):
     if class_counts[class_name] == 1:
         return class_name
     return f'{template_idx:02d}_{class_name}'
+
+
+def _template_construct_config(template):
+    template_config = dict(template)
+    for key in (
+            'name',
+            'pipeline',
+            'n_samples',
+            'max_sampling',
+            'amide_bond_check',
+            'sanitize_generation',
+            'santinize_generation',
+            'sanitize',
+            'santinize',
+            'resume_generation',
+        ):
+        template_config.pop(key, None)
+    return template_config
 
 
 def _merge_pipeline_options(config, template):
@@ -1391,6 +1939,8 @@ def main(args, opt_args):
     model.eval()
 
     sample_opt = config.get('sample_opt', {})
+    prefetch_opt = _resolve_prefetch_options(config, args)
+    postprocess_opt = _resolve_postprocess_options(config, args)
     
     # load dataset and dataloader
     batch_size = config.get('batch_size', 32)
@@ -1411,7 +1961,7 @@ def main(args, opt_args):
         run_dir = os.path.join(args.save_dir, run_name)
         out_dir = os.path.join(run_dir, 'candidates')
         os.makedirs(out_dir, exist_ok=True)
-        dataset = PDBDataset(**config['dataset'], template_config=R.construct(template))
+        dataset = PDBDataset(**config['dataset'], template_config=R.construct(_template_construct_config(template)))
         n_inputs = len(dataset.pdb_paths)
         max_sampling = _resolve_max_sampling(max_sampling_config, pipeline_opt, n_samples, n_inputs)
         resume_state = None
@@ -1469,6 +2019,9 @@ def main(args, opt_args):
             max_sampling=max_sampling_for_run,
             resume_state=resume_state,
             amide_check_opt=amide_check_opt,
+            prefetch_opt=prefetch_opt,
+            prefetch_seed=seed + template_idx * 10000019,
+            postprocess_opt=postprocess_opt,
         )
 
 
