@@ -1,0 +1,192 @@
+dataset:
+  pdb_dir: ./api/CPtest
+  pdb_pattern: "*.pdb"
+  recursive: false
+  tgt_chains: R
+  lig_chains: L
+  pocket_threshold: 10.0
+
+seed: 12
+
+amide_bond_check:
+  enabled: true
+  max_c_n_distance: 1.8
+
+sample_opt:
+  guidance_scale: 2.0
+
+resume_generation:
+  enabled: false
+  previous_dir: null
+  remaining_sampling_budget: null
+
+sanitize_generation:
+  enabled: false
+  max_c_n_distance: 1.8
+
+generation_prefetch:
+  num_workers: 0
+  prefetch_batches: 2
+  backend: thread
+  allow_process_backend: false
+  start_method: spawn
+  torch_num_threads: 1
+
+generation_postprocess:
+  num_workers: 0
+  backend: process
+  start_method: spawn
+  torch_num_threads: 1
+
+task_split:
+  enabled: false
+  total: 1
+  index: 0
+
+templates:
+  - name: Alkene-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/Alkene-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [12,13,16,14,15]
+      c_term_atom_indices: [0,1,21,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: Amide-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/Amide-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [6,7,10,8,9]
+      c_term_atom_indices: [0,1,13,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: Disulfide-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/Disulfide-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [12,13,16,14,15]
+      c_term_atom_indices: [0,1,21,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: Ester-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/Ester-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [20,25,28,26,27]
+      c_term_atom_indices: [0,1,30,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: ThioEther-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/ThioEther-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [2,1,0,14,15]
+      c_term_atom_indices: [12,11,13,10,5]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: ThioEther-B
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/ThioEther-B/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [14,15,18,16,17]
+      c_term_atom_indices: [0,1,31,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: ThioEther-C
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/ThioEther-C/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [9,10,13,11,12]
+      c_term_atom_indices: [0,1,29,2,3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+  - name: Triazole-A
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/Triazole-A/accepted_energy_filtered_sdf
+      pattern: "*.sdf"
+      sampling_mode: with_replacement
+      index_base: 0
+      n_term_atom_indices: [16,17,20,18,19]
+      c_term_atom_indices: [2,1,0,3,4]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: null
+      rmsd_cutoff: 1.0
+      clash_threshold: 0.8
+      output_dir: accepted
+
+batch_size: 128
