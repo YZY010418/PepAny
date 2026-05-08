@@ -1,20 +1,11 @@
 # PepAny: Generating cyclic peptide binders with any cyclization topologies
 
-PepAny is a generation pipeline for designing peptide binders, with support for linear peptides, capped or cyclized peptides, small-molecule-like ligand generation, and antibody CDR generation. The cyclic peptide workflow is built around terminal-geometry conditioned generation followed by structure-level filtering, so users can screen multiple cyclization chemistries against the same protein targets.
+**PepAny** is a generative model for peptide binder design that allows CFG control over the terminal amides. Given a capping structure, PepAny can automatically read the terminal constraints, and attempts to sample peptide binders that can merge with the capping structure and produce cyclic peptide binders.
 
-This repository is an example application of CPSea-2.
+This model is an example application of [**CPSea-2**](https://anonymous.4open.science/r/CPSea2-6CF5).
 
 ![PepAny overview](assets/cover.png)
 
-## Main Features
-
-- Generate peptide binders from receptor structures.
-- Support multiple template classes, including `LinearPeptide`, `CappedLinearPeptide`, `DeNovoCappedLinearPeptide`, `Molecule`, and `Antibody`.
-- Run cyclic peptide generation with user-defined terminal cap SDF libraries.
-- Filter generated candidates by terminal RMSD, receptor clash, and ligand amide bond geometry.
-- Resume incomplete generation runs from previous output directories.
-- Track generated candidates, accepted structures, per-target success rates, and remaining sampling budgets.
-- Split large generation jobs across multiple GPUs or nodes.
 
 ## Installation
 
@@ -25,28 +16,18 @@ conda env create -f env_cuda121.yaml
 conda activate PepAny
 ```
 
-Other provided environment files:
+Please download our pretrained weights by
 
 ```bash
-env_cuda117.yaml
-env_cuda128.yaml
-```
-
-If you install dependencies manually, make sure the environment includes PyTorch, PyG `pytorch-scatter`, RDKit, OpenBabel, OpenMM, PDBFixer, Biopython, ANARCI, MMseqs2, and the Python packages listed in the environment files.
-
-## Checkpoints
-
-Place the trained checkpoint under `checkpoints/`, for example:
-
-```text
-checkpoints/pepany_v1.ckpt
+mkdir checkpoints
+wget -c "https://zenodo.org/records/20080102/files/pepany_v1.ckpt?download=1" -O checkpoints/pepany_v1.ckpt
 ```
 
 Then pass it to generation with `--ckpt`.
 
 ## Quick Start
 
-Run cyclic peptide generation with the demo config:
+Run peptide generation with the demo config:
 
 ```bash
 python -m api.generate \
@@ -56,41 +37,104 @@ python -m api.generate \
   --gpu 0
 ```
 
-Run nanobody or antibody CDR generation:
-
-```bash
-python -m api.generate \
-  --config api/demo/nanobody_config.yaml \
-  --ckpt checkpoints/pepany_v1.ckpt \
-  --save_dir outputs/nanobody_demo \
-  --gpu 0
-```
-
-Use `--gpu -1` to run on CPU, although generation will be much slower.
-
 ## Input Config
 
-Generation is controlled by a YAML file. A minimal dataset block looks like:
+Generation is controlled by a YAML file. A minimal configuration that generate linear peptide binders looks like:
 
 ```yaml
 dataset:
-  pdb_dir: ./api/CPtest
-  pdb_pattern: "*.pdb"
-  recursive: false
-  tgt_chains: R
-  lig_chains: L
-  ligand_size_mode: ca
+  pdb_path: ./api/CPtest/target_with_reference_ligand.pdb
+  tgt_chains: R # target chains used as receptor
+  lig_chains: L # reference ligand chain used for define pocket
+  pocket_threshold: 10.0 # receptor residues within this distance from ligand are used as pocket
 
+templates:
+  - name: linear_peptide_capped
+    class: Peptide
+    capping: true
+    size_min: 8
+    size_max: 13
+  - name: linear_peptide_uncapped
+    class: Peptide
+    capping: false
+    size_from_ligand: true
+
+n_samples: 10
 seed: 12
-batch_size: 128
+batch_size: 10
 ```
 
-For cyclic peptide generation, each template defines a cyclization topology and an SDF library of terminal cap conformers:
+* `size_min` is inclusive and `size_max` is exclusive, so the example samples 8-12 core peptide residues. You can also use `size_from_ligand` where the generated peptides will be of the same length as the ligand reference.
+* By default the model generate linear peptides with ACE at N terminal and NME at C terminal as capping structures. You can choose not to include these capping structures by setting `capping: false`
+* `pocket_threshold` controls the automatic receptor pocket cutoff in Angstroms based on CA distances.
+
+**If your input PDBs contain only the target chain**, omit `lig_chains`. PepAny will:
+
+(1) use all selected target-chain residues as context and generate a new peptide chain named by `generated_lig_chain`:
+
+```yaml
+dataset:
+  pdb_path: ./api/target_only/target.pdb
+  tgt_chains: R
+  generated_lig_chain: L
+
+templates:
+  - name: linear_peptide_capped
+    class: Peptide
+    capping: true
+    size_min: 8
+    size_max: 13
+  - name: linear_peptide_uncapped
+    class: Peptide
+    capping: false
+    size_from_ligand: true
+
+n_samples: 10
+seed: 12
+batch_size: 10
+```
+
+(2) use residues that are manually appointed by `pocket_residues`, which is supposed to be a list of `(chainID, resID, res_ins_code)` tuples:
+
+```yaml
+dataset:
+  pdb_path: ./api/target_only/target.pdb
+  tgt_chains: R
+  generated_lig_chain: L
+  pocket_residues:
+    - [R, 42, ""]
+    - [R, 43, ""]
+    - [R, 57, A]
+```
+
+For multiple input files, put the pocket residues in a TSV and point `pocket_residues_tsv` to it:
+
+```yaml
+dataset:
+  pdb_paths:
+    - ./api/target_only/target_a.pdb
+    - ./api/target_only/target_b.pdb
+  tgt_chains: R
+  generated_lig_chain: L
+  pocket_residues_tsv: ./api/target_only/pockets.tsv
+```
+
+The TSV must have one residue per row. File names can match the full path, basename, or stem:
+
+```tsv
+pdb_file	chain_id	res_id	res_ins_code
+target_a.pdb	R	42	.
+target_a.pdb	R	43	.
+target_b.pdb	R	57	A
+```
+
+**For cyclic peptide generation**, we add additional conditions in template that define a cyclization topology and an SDF library of terminal cap conformers:
 
 ```yaml
 templates:
   - name: ThioEther-C
-    class: DeNovoCappedLinearPeptide
+    class: Peptide
+    capping: true
     size_from_ligand: true
     term_rel_pos_sdf:
       path: ./api/CPcap/ThioEther-C/accepted_energy_filtered_sdf
@@ -110,13 +154,52 @@ templates:
 
 Important fields:
 
-- `goal_num`: number of accepted structures required for each target.
-- `max_sampling_number`: maximum number of candidate generations before stopping. Use `null` for no fixed budget.
-- `sampling_mode: with_replacement`: terminal conformers may be reused.
-- `sampling_mode: without_replacement`: terminal conformers are shuffled and consumed without reuse.
+- `goal_num`: number of accepted structures required *for each target*.
+- `max_sampling_number`: maximum number of candidate generations before stopping. Use `null` for no fixed budget (i.e., infinite samping until satisfying the goal_num).
+- `sampling_mode`: with_replacement means terminal conformers may be reused. without_replacement means terminal conformers are shuffled and consumed without reuse.
 - `rmsd_cutoff`: terminal cap alignment cutoff used by the accepted pipeline.
 - `clash_threshold`: receptor clash distance threshold.
 - `seed`: random seed. It can also be overridden by `--seed`.
+
+If you want to use only one terminal-cap SDF instead of a directory of SDF files, set `term_rel_pos_sdf.path` directly to that file and omit `pattern`:
+
+```yaml
+templates:
+  - name: ThioEther-C_single_sdf
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/ThioEther-C/example_cap.sdf
+      index_base: 0
+      n_term_atom_indices: [9, 10, 13, 11, 12]
+      c_term_atom_indices: [0, 1, 29, 2, 3]
+    pipeline:
+      enabled: true
+      goal_num: 10
+      max_sampling_number: 100000
+```
+
+If you do not want to use the automatic pipeline, omit the `pipeline` block or set `pipeline.enabled: false`. PepAny will still use `term_rel_pos_sdf` as a terminal geometry condition, but it will only write raw candidates under `candidates/`; it will not merge the cap, run RMSD/clash filtering, or write an `accepted/` directory. In this mode, use `n_samples` to control how many candidates are generated:
+
+```yaml
+templates:
+  - name: ThioEther-C_raw_candidates
+    class: Peptide
+    capping: true
+    size_from_ligand: true
+    term_rel_pos_sdf:
+      path: ./api/CPcap/ThioEther-C/example_cap.sdf
+      index_base: 0
+      n_term_atom_indices: [9, 10, 13, 11, 12]
+      c_term_atom_indices: [0, 1, 29, 2, 3]
+    pipeline:
+      enabled: false
+
+n_samples: 100
+```
+
+Note: When `capping: false`, PepAny skips the cyclic accepted pipeline even if `pipeline.enabled` is set, because terminal cap merging requires the capped scaffold.
 
 ## Output Layout
 
@@ -183,22 +266,6 @@ resume_generation:
 
 For example, if the previous run generated 100000 candidates, `remaining_sampling_budget: 20000` makes the effective stopping point 120000 total candidates. This is useful when you want to extend a hard target or cyclization by a controlled number of additional attempts.
 
-## Sanitize Existing Accepted Structures
-
-The accepted pipeline checks ligand amide C-N distances during generation. You can also sanitize a previous accepted directory before resuming:
-
-```yaml
-resume_generation:
-  enabled: true
-  previous_dir: outputs/demo
-
-sanitize_generation:
-  enabled: true
-  max_c_n_distance: 1.8
-```
-
-Sanitization scans only accepted `.cif` files, removes structures with implausible ligand amide distances, renames the remaining accepted structures to keep continuous indices, and rewrites `metadata.csv`. It does not modify `candidates/`.
-
 ## Parallel Generation
 
 Large jobs can be split across GPUs or nodes with `task_split`:
@@ -230,7 +297,7 @@ python -m api.generate ... --seed 113
 python -m api.generate ... --seed 213
 ```
 
-## CPU Parallelism
+## Parallel CPU Processing
 
 Candidate post-processing can be parallelized on CPU:
 
@@ -241,6 +308,8 @@ generation_postprocess:
   start_method: spawn
   torch_num_threads: 1
 ```
+
+Post-processing happens after the model samples a batch. It converts sampled tensors into PDB/SDF files, runs template validation, checks ligand amide geometry, and, when the accepted pipeline is enabled, performs cap merging plus RMSD/clash filtering. These steps can be CPU-heavy, so `generation_postprocess.num_workers > 0` can improve throughput when the GPU is waiting for file writing or filtering.
 
 Generation batch prefetch is also configurable:
 
@@ -254,49 +323,17 @@ generation_prefetch:
   torch_num_threads: 1
 ```
 
-For many GPU workloads, a larger `batch_size` is more beneficial than process-based prefetching. If `max_sampling_number` is set, prefetching is disabled to preserve the exact attempt limit.
+Prefetch prepares upcoming generation batches on CPU while the GPU is sampling the current batch. In practice, it calls dataset indexing and collation ahead of time, so it can help when input parsing, pocket construction, or batch assembly becomes a bottleneck. `prefetch_batches` controls how many prepared batches can wait in the queue.
 
-## Useful Commands
+Backend choices:
 
-Resume a previous run and add 20000 more candidate attempts:
+- `backend: thread` uses worker threads in the same Python process. It has low overhead and shares memory with the main process. This is the default for `generation_prefetch` because it is usually safer for GPU jobs and avoids copying the dataset into separate processes.
+- `backend: process` uses separate Python worker processes. It can help for heavier CPU-bound post-processing, which is why it is the default for `generation_postprocess`. For prefetching, process mode is disabled unless `allow_process_backend: true`, because each worker needs its own Python and dataset state and this can be expensive or unstable for large GPU runs.
+- `num_workers: 0` disables parallel workers and runs the step in the main process.
 
-```bash
-python -m api.generate \
-  --config api/demo/config.yaml \
-  --ckpt checkpoints/pepany_v1.ckpt \
-  --save_dir outputs/demo \
-  --gpu 0
-```
+`start_method` only applies to `backend: process`. `spawn` starts a clean Python process and is the safest default across macOS/Linux and CUDA-heavy jobs, though it has more startup overhead. `fork` can start faster on Linux, but it inherits process state and is more likely to cause issues with CUDA, RDKit, or already-initialized libraries. Use `forkserver` only if you already know it works well in your environment.
 
-The YAML should include:
+`torch_num_threads` limits PyTorch CPU threads inside each worker. Keeping it at `1` avoids oversubscribing CPU cores when multiple workers are running.
 
-```yaml
-resume_generation:
-  enabled: true
-  previous_dir: outputs/demo
-  remaining_sampling_budget: 20000
-```
+For many GPU workloads, increasing `batch_size` is more beneficial than process-based prefetching. If `max_sampling_number` is set, prefetching is disabled to preserve the exact attempt limit.
 
-Run one shard of a multi-GPU job:
-
-```bash
-python -m api.generate \
-  --config api/demo/config.yaml \
-  --ckpt checkpoints/pepany_v1.ckpt \
-  --save_dir outputs/demo \
-  --gpu 1 \
-  --num_shards 3 \
-  --shard_id 1
-```
-
-## Notes
-
-- The cyclic peptide demo config references terminal cap SDF libraries under `api/CPcap/`. Prepare these libraries before running the cyclic generation pipeline.
-- Accepted structures are saved as `.cif`; raw candidates are saved as `.pdb` and `.sdf`.
-- During resume, accepted structure indices continue from the previous accepted directory to avoid overwriting files.
-- During resume, candidate indices also continue from previous candidate slots.
-- When comparing cyclization topologies, report both accepted counts and generated candidate counts whenever possible, because hard targets may receive more attempts than easy targets near the end of a run.
-
-## License
-
-This project is released under the MIT License. See [LICENSE](LICENSE) for details.

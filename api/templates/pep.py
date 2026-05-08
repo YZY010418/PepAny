@@ -13,6 +13,17 @@ from data.peptide import compute_terminal_rel_pos_from_sdf
 from .base import BaseTemplate, ComplexDesc
 
 
+def _as_bool(value):
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in {'true', '1', 'yes', 'y', 'on'}:
+            return True
+        if value in {'false', '0', 'no', 'n', 'off'}:
+            return False
+        raise ValueError(f'Cannot parse boolean value: {value!r}')
+    return bool(value)
+
+
 class TermRelPosSDFSampler:
 
     def __init__(self, config):
@@ -130,8 +141,9 @@ class TermRelPosSDFSampler:
         return term_rel_pos, metadata
 
 
-@R.register('LinearPeptide')
-class LinearPeptide(BaseTemplate):
+@R.register('Peptide')
+class Peptide(BaseTemplate):
+    """Generate a peptide, with synthetic ACE/NME caps by default."""
 
     def __init__(
             self,
@@ -141,6 +153,9 @@ class LinearPeptide(BaseTemplate):
             term_rel_pos_sdf=None,
             size_from_ligand=False,
             ligand_size_offset=0,
+            capping=True,
+            n_cap_name='ACE',
+            c_cap_name='NME',
         ):
         super().__init__(
             size_min,
@@ -160,197 +175,20 @@ class LinearPeptide(BaseTemplate):
             self.term_rel_pos = np.asarray(term_rel_pos, dtype=np.float32)
             if self.term_rel_pos.shape != (15,):
                 raise ValueError('term_rel_pos must be a 15-dimensional CFG condition')
-
-    def dummy_lig_block_bonds(self, cplx_desc, size):
-        blocks = [Block(
-            name='GLY', # use glycine instead of UNK so that is_aa can be identified as True
-            atoms=[Atom(name='C', coordinate=[0, 0, 0], element='C', id=-1)],
-            id=(i + 1, '')
-        ) for i in range(size)]
-        bonds = []
-        return blocks, bonds
-
-    def set_control(self, data, cplx_desc=None):
-        term_rel_pos = self.term_rel_pos
-        control = None
-        if self.term_rel_pos_sampler is not None:
-            term_rel_pos, control = self.term_rel_pos_sampler.sample()
-        if term_rel_pos is not None:
-            term_rel_pos = torch.as_tensor(
-                term_rel_pos,
-                dtype=data['term_rel_pos'].dtype,
-                device=data['term_rel_pos'].device
-            )
-            data['term_rel_pos'].zero_()
-            data['term_rel_pos'][data['generate_mask']] = term_rel_pos
-        if cplx_desc is not None and control is not None:
-            cplx_desc.control = control
-        return data
-
-
-@R.register('CappedLinearPeptide')
-class CappedLinearPeptide(LinearPeptide):
-    """Generate peptide residues while preserving reference terminal cap blocks."""
-
-    def __init__(
-            self,
-            size_min=None,
-            size_max=None,
-            term_rel_pos=None,
-            term_rel_pos_sdf=None,
-            size_from_ligand=False,
-            ligand_size_offset=0,
-            n_cap_block_index=0,
-            c_cap_block_index=-1,
-            n_cap_residue_name=None,
-            c_cap_residue_name=None,
-            preserve_residue_names=None,
-        ):
-        super().__init__(
-            size_min,
-            size_max,
-            term_rel_pos,
-            term_rel_pos_sdf,
-            size_from_ligand=size_from_ligand,
-            ligand_size_offset=ligand_size_offset,
-        )
-        self.n_cap_block_index = n_cap_block_index
-        self.c_cap_block_index = c_cap_block_index
-        self.n_cap_residue_name = n_cap_residue_name
-        self.c_cap_residue_name = c_cap_residue_name
-        if preserve_residue_names is None:
-            preserve_residue_names = ('ACE', 'NME', 'LI0', 'LI1')
-        self.preserve_residue_names = tuple(str(name) for name in preserve_residue_names)
-
-    def _copy_block(self, block, new_id):
-        block = deepcopy(block)
-        block.id = new_id
-        return block
-
-    def _copy_cap_bonds(self, source_cplx, source_chain, source_block, target_mol_idx, target_block_idx):
-        source_mol_idx = source_cplx.id2idx[source_chain]
-        source_block_idx = source_cplx[source_chain].id2idx[source_block.id]
-        bonds = []
-        for bond in source_cplx.bonds:
-            if bond.index1[:2] != (source_mol_idx, source_block_idx):
-                continue
-            if bond.index2[:2] != (source_mol_idx, source_block_idx):
-                continue
-            bonds.append(Bond(
-                index1=(target_mol_idx, target_block_idx, bond.index1[2]),
-                index2=(target_mol_idx, target_block_idx, bond.index2[2]),
-                bond_type=bond.bond_type
-            ))
-        return bonds
-
-    def _validate_cap_block(self, block, label):
-        original_name = block.properties.get('original_name', None)
-        if original_name is not None and original_name != block.name:
-            raise ValueError(
-                f'{label} cap block {block.id} is a tokenizer fragment "{block.name}" '
-                f'from residue "{original_name}". Add "{original_name}" to '
-                'preserve_residue_names or choose the cap residue after preserving it.'
-            )
-
-    def _select_cap_block(self, ref_blocks, residue_name, block_index, label):
-        if residue_name is None:
-            return ref_blocks[block_index]
-
-        residue_name = str(residue_name)
-        matches = [
-            block for block in ref_blocks
-            if block.name == residue_name or block.properties.get('original_name', None) == residue_name
-        ]
-        if len(matches) != 1:
-            available = [
-                block.properties.get('original_name', block.name)
-                for block in ref_blocks
-            ]
-            raise ValueError(
-                f'{label} cap residue "{residue_name}" matched {len(matches)} blocks. '
-                f'Available ligand blocks: {available}'
-            )
-        return matches[0]
-
-    def __call__(self, cplx_desc: ComplexDesc) -> ComplexDesc:
-        cplx_desc = deepcopy(cplx_desc)
-        lig_chain = cplx_desc.lig_chains[0]
-        ref_blocks = list(cplx_desc.cplx[lig_chain])
-        if len(ref_blocks) < 2:
-            raise ValueError('CappedLinearPeptide requires a reference ligand chain with at least two cap blocks')
-
-        n_cap_ref = self._select_cap_block(
-            ref_blocks, self.n_cap_residue_name, self.n_cap_block_index, 'N-terminal'
-        )
-        c_cap_ref = self._select_cap_block(
-            ref_blocks, self.c_cap_residue_name, self.c_cap_block_index, 'C-terminal'
-        )
-        self._validate_cap_block(n_cap_ref, 'N-terminal')
-        self._validate_cap_block(c_cap_ref, 'C-terminal')
-        core_size = self.sample_size(cplx_desc)
-
-        blocks = [self._copy_block(n_cap_ref, (1, ''))]
-        blocks.extend(Block(
-            name='GLY',
-            atoms=[Atom(name='C', coordinate=[0, 0, 0], element='C', id=-1)],
-            id=(i + 2, '')
-        ) for i in range(core_size))
-        blocks.append(self._copy_block(c_cap_ref, (core_size + 2, '')))
-
-        cplx_without_ligand = remove_mols(cplx_desc.cplx, cplx_desc.lig_chains)
-        target_mol_idx = len(cplx_without_ligand.molecules)
-        cap_bonds = []
-        cap_bonds.extend(self._copy_cap_bonds(cplx_desc.cplx, lig_chain, n_cap_ref, target_mol_idx, 0))
-        cap_bonds.extend(self._copy_cap_bonds(cplx_desc.cplx, lig_chain, c_cap_ref, target_mol_idx, len(blocks) - 1))
-
-        dummy_mol = Molecule(
-            name='dummy',
-            blocks=blocks,
-            id=lig_chain,
-        )
-        cplx_desc.cplx = Complex(
-            name=cplx_without_ligand.name,
-            molecules=cplx_without_ligand.molecules + [dummy_mol],
-            bonds=cplx_without_ligand.bonds + cap_bonds,
-            properties=cplx_without_ligand.properties
-        )
-        cplx_desc = self.set_desc_attr(cplx_desc)
-        n_pocket = len(cplx_desc.pocket_block_ids)
-        n_lig = len(cplx_desc.lig_block_ids)
-        cplx_desc.topo_generate_mask = (
-            [0 for _ in range(n_pocket)]
-            + [0]
-            + [1 for _ in range(n_lig - 2)]
-            + [0]
-        )
-        return cplx_desc
-
-
-@R.register('DeNovoCappedLinearPeptide')
-class DeNovoCappedLinearPeptide(LinearPeptide):
-    """Generate a peptide with synthetic ACE/NME cap blocks."""
-
-    def __init__(
-            self,
-            size_min=None,
-            size_max=None,
-            term_rel_pos=None,
-            term_rel_pos_sdf=None,
-            size_from_ligand=False,
-            ligand_size_offset=0,
-            n_cap_name='ACE',
-            c_cap_name='NME',
-        ):
-        super().__init__(
-            size_min,
-            size_max,
-            term_rel_pos,
-            term_rel_pos_sdf,
-            size_from_ligand=size_from_ligand,
-            ligand_size_offset=ligand_size_offset,
-        )
+        self.capping = _as_bool(capping)
         self.n_cap_name = str(n_cap_name)
         self.c_cap_name = str(c_cap_name)
+
+    @property
+    def uses_capping(self):
+        return self.capping
+
+    def _gly_block(self, block_id):
+        return Block(
+            name='GLY', # use glycine instead of UNK so that is_aa can be identified as True
+            atoms=[Atom(name='C', coordinate=[0, 0, 0], element='C', id=-1)],
+            id=block_id,
+        )
 
     def _ace_block(self, block_id):
         return Block(
@@ -382,25 +220,48 @@ class DeNovoCappedLinearPeptide(LinearPeptide):
             Bond((target_mol_idx, c_cap_block_idx, 0), (target_mol_idx, c_cap_block_idx, 1), BondType.SINGLE),
         ]
 
+    def _blocks_and_bonds(self, core_size, target_mol_idx):
+        if not self.capping:
+            blocks = [self._gly_block((i + 1, '')) for i in range(core_size)]
+            return blocks, []
+
+        blocks = [self._ace_block((1, ''))]
+        blocks.extend(self._gly_block((i + 2, '')) for i in range(core_size))
+        blocks.append(self._nme_block((core_size + 2, '')))
+        return blocks, self._cap_bonds(target_mol_idx, 0, len(blocks) - 1)
+
+    def dummy_lig_block_bonds(self, cplx_desc, size):
+        cplx_without_ligand = remove_mols(cplx_desc.cplx, cplx_desc.lig_chains)
+        target_mol_idx = len(cplx_without_ligand.molecules)
+        return self._blocks_and_bonds(size, target_mol_idx)
+
     def set_control(self, data, cplx_desc=None):
-        data['term_rel_pos'].zero_()
-        return super().set_control(data, cplx_desc=cplx_desc)
+        if self.capping:
+            data['term_rel_pos'].zero_()
+        term_rel_pos = self.term_rel_pos
+        control = None
+        if self.term_rel_pos_sampler is not None:
+            term_rel_pos, control = self.term_rel_pos_sampler.sample()
+        if term_rel_pos is not None:
+            term_rel_pos = torch.as_tensor(
+                term_rel_pos,
+                dtype=data['term_rel_pos'].dtype,
+                device=data['term_rel_pos'].device
+            )
+            data['term_rel_pos'].zero_()
+            data['term_rel_pos'][data['generate_mask']] = term_rel_pos
+        if cplx_desc is not None and control is not None:
+            cplx_desc.control = control
+        return data
 
     def __call__(self, cplx_desc: ComplexDesc) -> ComplexDesc:
         cplx_desc = deepcopy(cplx_desc)
         lig_chain = cplx_desc.lig_chains[0]
         core_size = self.sample_size(cplx_desc)
 
-        blocks = [self._ace_block((1, ''))]
-        blocks.extend(Block(
-            name='GLY',
-            atoms=[Atom(name='C', coordinate=[0, 0, 0], element='C', id=-1)],
-            id=(i + 2, '')
-        ) for i in range(core_size))
-        blocks.append(self._nme_block((core_size + 2, '')))
-
         cplx_without_ligand = remove_mols(cplx_desc.cplx, cplx_desc.lig_chains)
         target_mol_idx = len(cplx_without_ligand.molecules)
+        blocks, bonds = self._blocks_and_bonds(core_size, target_mol_idx)
         dummy_mol = Molecule(
             name='dummy',
             blocks=blocks,
@@ -409,16 +270,17 @@ class DeNovoCappedLinearPeptide(LinearPeptide):
         cplx_desc.cplx = Complex(
             name=cplx_without_ligand.name,
             molecules=cplx_without_ligand.molecules + [dummy_mol],
-            bonds=cplx_without_ligand.bonds + self._cap_bonds(target_mol_idx, 0, len(blocks) - 1),
+            bonds=cplx_without_ligand.bonds + bonds,
             properties=cplx_without_ligand.properties
         )
         cplx_desc = self.set_desc_attr(cplx_desc)
-        n_pocket = len(cplx_desc.pocket_block_ids)
-        n_lig = len(cplx_desc.lig_block_ids)
-        cplx_desc.topo_generate_mask = (
-            [0 for _ in range(n_pocket)]
-            + [0]
-            + [1 for _ in range(n_lig - 2)]
-            + [0]
-        )
+        if self.capping:
+            n_pocket = len(cplx_desc.pocket_block_ids)
+            n_lig = len(cplx_desc.lig_block_ids)
+            cplx_desc.topo_generate_mask = (
+                [0 for _ in range(n_pocket)]
+                + [0]
+                + [1 for _ in range(n_lig - 2)]
+                + [0]
+            )
         return cplx_desc

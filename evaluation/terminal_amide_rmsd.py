@@ -76,7 +76,7 @@ def parse_args():
         help=(
             'Optional generated atom indexes in the same default 10-atom order: '
             f'{",".join(TERMINAL_AMIDE_ORDER)}. '
-            'If omitted, infer indexes for DeNovoCappedLinearPeptide outputs.'
+            'If omitted, infer indexes for capped Peptide outputs.'
         )
     )
     parser.add_argument(
@@ -235,12 +235,12 @@ def choose_one(candidates, label):
 
 
 def infer_terminal_amide_indexes(mol):
-    """Infer indexes in TERMINAL_AMIDE_ORDER for DeNovoCappedLinearPeptide SDF atom order."""
+    """Infer indexes in TERMINAL_AMIDE_ORDER for capped Peptide SDF atom order."""
     num_atoms = mol.GetNumAtoms()
     if num_atoms < 10:
         raise ValueError(f'Need at least 10 atoms to infer capped peptide termini, got {num_atoms}')
 
-    # DeNovoCappedLinearPeptide writes ACE first: [ACE.CA, ACE.C, ACE.O],
+    # Capped Peptide writes ACE first: [ACE.CA, ACE.C, ACE.O],
     # then peptide residues in canonical order, and NME last: [NME.N, NME.CA].
     n_term = [0, 1, 2, 3, 4]
     nme_n = num_atoms - 2
@@ -403,7 +403,7 @@ def remap_indexes(indexes, old_to_new, label):
 
 
 def merge_terminal_cap(ref_mol, ref_indexes, gen_mol, gen_indexes):
-    """Merge an aligned reference cap into a DeNovoCappedLinearPeptide output.
+    """Merge an aligned reference cap into a capped Peptide output.
 
     The two 5-atom groups are interpreted in comparison order:
     first group maps to the generated N side and second group maps to the
