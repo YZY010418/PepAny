@@ -1,11 +1,18 @@
-#!/usr/bin/env bash
-#SBATCH --job-name=pepany-cfg-scan
-#SBATCH --array=0-11
+#!/bin/bash
+#SBATCH -J PepAny_CFG_Scan
+#SBATCH -N 1
+#SBATCH -p a01
+#SBATCH -o CFGScan_stdout_%A_%a.log
+#SBATCH -e CFGScan_stderr_%A_%a.log
+#SBATCH --no-requeue
+#SBATCH -c 8
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=24:00:00
-#SBATCH --output=cfg_scale_%A_%a.out
+#SBATCH --array=0-11
+
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+source /WORK/PUBLIC/liulei_work/miniconda3/bin/activate
+conda activate PepAny
 
 set -Eeuo pipefail
 
@@ -16,13 +23,13 @@ if (( TASK_ID < 0 || TASK_ID >= ${#SCALES[@]} )); then
     exit 2
 fi
 
-REPO_ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-BASE_CONFIG="${BASE_CONFIG:-${REPO_ROOT}/api/demo/config.yaml}"
+REPO_ROOT="${REPO_ROOT:-/home/fit/liulei/WORK/PepAny}"
+BASE_CONFIG="${BASE_CONFIG:-${REPO_ROOT}/api/config1.yaml}"
 CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/checkpoints/pepany_v1.ckpt}"
 CPCAP_ROOT="${CPCAP_ROOT:-${REPO_ROOT}/api/CPcap}"
 CPTEST_DIR="${CPTEST_DIR:-${REPO_ROOT}/api/CPtest}"
 CPTEST_ARCHIVE="${CPTEST_ARCHIVE:-${REPO_ROOT}/api/CPtest.tar.gz}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs/cfg_scale_scan}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/evaluation/CFGScaleScan}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_INDEX="${GPU_INDEX:-0}"
 N_TARGETS="${N_TARGETS:-10}"
@@ -37,6 +44,8 @@ SCALE="${SCALES[$TASK_ID]}"
 SCALE_TAG="${SCALE/./p}"
 RUN_DIR="${OUTPUT_ROOT}/scale_${SCALE_TAG}"
 RUN_CONFIG="${RUN_DIR}/config.yaml"
+
+cd "$REPO_ROOT"
 
 for required_file in "$BASE_CONFIG" "$CHECKPOINT"; do
     if [[ ! -f "$required_file" ]]; then
@@ -196,7 +205,6 @@ if [[ "$DRY_RUN" == "1" ]]; then
     exit 0
 fi
 
-cd "$REPO_ROOT"
 "$PYTHON_BIN" -m api.generate \
     --config "$RUN_CONFIG" \
     --ckpt "$CHECKPOINT" \
