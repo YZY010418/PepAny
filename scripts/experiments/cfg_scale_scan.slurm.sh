@@ -7,7 +7,7 @@
 #SBATCH --no-requeue
 #SBATCH -c 8
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-11
+#SBATCH --array=0-1
 
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
@@ -16,12 +16,15 @@ conda activate PepAny
 
 set -Eeuo pipefail
 
-SCALES=(0.0 0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0 4.5 5.0 5.5)
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-if (( TASK_ID < 0 || TASK_ID >= ${#SCALES[@]} )); then
-    echo "SLURM_ARRAY_TASK_ID must be between 0 and $((${#SCALES[@]} - 1)); got ${TASK_ID}" >&2
-    exit 2
-fi
+case "$TASK_ID" in
+    0) TASK_SCALES=(0.0 0.5 1.0 1.5 2.0 2.5) ;;
+    1) TASK_SCALES=(3.0 3.5 4.0 4.5 5.0 5.5) ;;
+    *)
+        echo "SLURM_ARRAY_TASK_ID must be 0 or 1; got ${TASK_ID}" >&2
+        exit 2
+        ;;
+esac
 
 REPO_ROOT="${REPO_ROOT:-/home/fit/liulei/WORK/PepAny}"
 BASE_CONFIG="${BASE_CONFIG:-${REPO_ROOT}/api/config1.yaml}"
@@ -34,16 +37,13 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_INDEX="${GPU_INDEX:-0}"
 N_TARGETS="${N_TARGETS:-10}"
 N_SAMPLES="${N_SAMPLES:-10}"
+MAX_SAMPLING="${MAX_SAMPLING:-}"
 TARGET_SEED="${TARGET_SEED:-2026}"
 GENERATION_SEED="${GENERATION_SEED:-20260724}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 POSTPROCESS_WORKERS="${POSTPROCESS_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}"
 TARGET_LIST="${TARGET_LIST:-}"
 DRY_RUN="${DRY_RUN:-0}"
-SCALE="${SCALES[$TASK_ID]}"
-SCALE_TAG="${SCALE/./p}"
-RUN_DIR="${OUTPUT_ROOT}/scale_${SCALE_TAG}"
-RUN_CONFIG="${RUN_DIR}/config.yaml"
 
 cd "$REPO_ROOT"
 
@@ -61,11 +61,6 @@ if [[ -n "$TARGET_LIST" && ! -f "$TARGET_LIST" ]]; then
     echo "TARGET_LIST does not exist: ${TARGET_LIST}" >&2
     exit 2
 fi
-if [[ -d "$RUN_DIR" && -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-    echo "Run directory is not empty: ${RUN_DIR}. Use a new OUTPUT_ROOT to avoid mixing results." >&2
-    exit 2
-fi
-
 if [[ ! -d "$CPTEST_DIR" ]]; then
     if [[ ! -f "$CPTEST_ARCHIVE" ]]; then
         echo "Neither CPTEST_DIR nor CPTEST_ARCHIVE exists." >&2
@@ -77,11 +72,27 @@ if [[ ! -d "$CPTEST_DIR" ]]; then
     CPTEST_DIR="${JOB_TMP}/CPtest"
 fi
 
-mkdir -p "$RUN_DIR"
+run_scale() {
+    local scale="$1"
+    local scale_tag="${scale/./p}"
+    local run_dir="${OUTPUT_ROOT}/scale_${scale_tag}"
+    local run_config="${run_dir}/config.yaml"
 
-"$PYTHON_BIN" - \
-    "$BASE_CONFIG" "$RUN_CONFIG" "$CPTEST_DIR" "$CPCAP_ROOT" "$TARGET_LIST" \
-    "$N_TARGETS" "$N_SAMPLES" "$TARGET_SEED" "$GENERATION_SEED" "$BATCH_SIZE" "$SCALE" <<'PY'
+    if [[ -f "${run_dir}/.complete" ]]; then
+        echo "Skipping completed CFG scale ${scale}: ${run_dir}"
+        return 0
+    fi
+    if [[ -d "$run_dir" && -n "$(find "$run_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        echo "Incomplete run directory is not empty: ${run_dir}. Move it aside or use a new OUTPUT_ROOT." >&2
+        return 2
+    fi
+
+    mkdir -p "$run_dir"
+
+    "$PYTHON_BIN" - \
+        "$BASE_CONFIG" "$run_config" "$CPTEST_DIR" "$CPCAP_ROOT" "$TARGET_LIST" \
+        "$N_TARGETS" "$N_SAMPLES" "$MAX_SAMPLING" "$TARGET_SEED" \
+        "$GENERATION_SEED" "$BATCH_SIZE" "$scale" <<'PY'
 import random
 import sys
 from pathlib import Path
@@ -97,6 +108,7 @@ import yaml
     target_list_path,
     n_targets,
     n_samples,
+    max_sampling,
     target_seed,
     generation_seed,
     batch_size,
@@ -155,7 +167,10 @@ for key in ("pdb_path", "pdb_paths", "pdb_dir", "pdb_pattern", "recursive"):
 dataset["pdb_paths"] = [str(path) for path in targets]
 
 config["n_samples"] = n_samples
-config["max_sampling"] = len(targets) * n_samples
+if max_sampling:
+    config["max_sampling"] = int(max_sampling)
+else:
+    config.pop("max_sampling", None)
 config["seed"] = generation_seed
 config["batch_size"] = batch_size
 config.setdefault("sample_opt", {})["guidance_scale"] = scale
@@ -179,6 +194,7 @@ if found_types != expected_types:
     raise ValueError(f"Expected the eight CPSea2 cyclization templates; found {sorted(found_types)}")
 
 for template in templates:
+    template.pop("max_sampling", None)
     cap_config = template.get("term_rel_pos_sdf")
     if not cap_config:
         raise ValueError(f"Template {template['name']} has no term_rel_pos_sdf configuration")
@@ -195,23 +211,29 @@ with run_config_path.open("w") as handle:
 
 print(f"CFG scale: {scale}")
 print(f"Samples: {len(targets)} targets x {len(templates)} types x {n_samples} = {len(targets) * len(templates) * n_samples}")
+print(f"Technical-attempt cap per type: {max_sampling or 'unlimited'}")
 print("Selected targets:")
 for target in targets:
     print(f"  {target.name}")
 PY
 
-if [[ "$DRY_RUN" == "1" ]]; then
-    echo "Dry run complete: ${RUN_CONFIG}"
-    exit 0
-fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "Dry run complete: ${run_config}"
+        return 0
+    fi
 
-"$PYTHON_BIN" -m api.generate \
-    --config "$RUN_CONFIG" \
-    --ckpt "$CHECKPOINT" \
-    --save_dir "$RUN_DIR" \
-    --gpu "$GPU_INDEX" \
-    --seed "$GENERATION_SEED" \
-    --postprocess_workers "$POSTPROCESS_WORKERS"
+    "$PYTHON_BIN" -m api.generate \
+        --config "$run_config" \
+        --ckpt "$CHECKPOINT" \
+        --save_dir "$run_dir" \
+        --gpu "$GPU_INDEX" \
+        --seed "$GENERATION_SEED" \
+        --postprocess_workers "$POSTPROCESS_WORKERS"
 
-touch "${RUN_DIR}/.complete"
-echo "Completed CFG scale ${SCALE}: ${RUN_DIR}"
+    touch "${run_dir}/.complete"
+    echo "Completed CFG scale ${scale}: ${run_dir}"
+}
+
+for assigned_scale in "${TASK_SCALES[@]}"; do
+    run_scale "$assigned_scale"
+done
