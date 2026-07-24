@@ -34,6 +34,7 @@ def wilson_interval(successes, total, z=1.96):
 
 def read_records(scan_dir, cutoff):
     records = []
+    missing_rmsd = 0
     for scale_dir in sorted(scan_dir.glob("scale_*"), key=scale_from_dir):
         scale = scale_from_dir(scale_dir)
         for result_path in sorted(scale_dir.glob("*/candidates/results.jsonl")):
@@ -44,19 +45,36 @@ def read_records(scan_dir, cutoff):
                     target = row["id"]
                     value = row.get("terminal_rmsd")
                     if value is None:
-                        raise ValueError(f"Missing terminal_rmsd in {result_path}:{line_number}")
-                    terminal_rmsd = float(value)
+                        # A post-processing/RMSD inference error is treated as
+                        # an RMSD failure, while retaining the row in the
+                        # success-rate denominator.
+                        terminal_rmsd = None
+                        missing_rmsd += 1
+                    else:
+                        try:
+                            terminal_rmsd = float(value)
+                        except (TypeError, ValueError):
+                            terminal_rmsd = None
+                            missing_rmsd += 1
+                        if terminal_rmsd is not None and not math.isfinite(terminal_rmsd):
+                            terminal_rmsd = None
+                            missing_rmsd += 1
                     records.append(
                         {
                             "scale": scale,
                             "target": target,
                             "cyclization_type": cyclization_type,
                             "terminal_rmsd": terminal_rmsd,
-                            "success": terminal_rmsd < cutoff,
+                            "success": terminal_rmsd is not None and terminal_rmsd < cutoff,
                         }
                     )
     if not records:
         raise FileNotFoundError(f"No results.jsonl files found under {scan_dir}")
+    if missing_rmsd:
+        print(
+            f"Warning: {missing_rmsd} records have no valid terminal_rmsd; "
+            "counted as RMSD failures and excluded from RMSD mean/median."
+        )
     return records
 
 
@@ -67,7 +85,7 @@ def summarize(records, group_fields):
 
     summary = []
     for key, rows in groups.items():
-        rmsds = [row["terminal_rmsd"] for row in rows]
+        rmsds = [row["terminal_rmsd"] for row in rows if row["terminal_rmsd"] is not None]
         successes = sum(row["success"] for row in rows)
         ci_low, ci_high = wilson_interval(successes, len(rows))
         summary.append(
@@ -79,8 +97,8 @@ def summarize(records, group_fields):
                 "success_rate": successes / len(rows),
                 "success_ci95_low": ci_low,
                 "success_ci95_high": ci_high,
-                "mean_terminal_rmsd": statistics.fmean(rmsds),
-                "median_terminal_rmsd": statistics.median(rmsds),
+                "mean_terminal_rmsd": statistics.fmean(rmsds) if rmsds else math.nan,
+                "median_terminal_rmsd": statistics.median(rmsds) if rmsds else math.nan,
             }
         )
     return sorted(summary, key=lambda row: tuple(row[field] for field in group_fields))
