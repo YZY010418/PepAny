@@ -201,6 +201,36 @@ n_samples: 100
 
 Note: When `capping: false`, PepAny skips the cyclic accepted pipeline even if `pipeline.enabled` is set, because terminal cap merging requires the capped scaffold.
 
+### Controlled raw sampling
+
+For a matched-budget comparison of the generation model itself, use the dedicated
+CPtest wrapper. It defaults to 100 model attempts per target and cyclization type,
+CFG scale 2.5, and a 15 Angstrom pocket cutoff:
+
+```bash
+python scripts/experiments/sample_cptest_raw.py \
+  --config api/demo/config.yaml \
+  --ckpt checkpoints/pepany_v1.ckpt \
+  --save-dir outputs/cptest_raw \
+  --gpu 0
+```
+
+This mode performs exactly 100 model attempts rather than sampling until 100
+candidates pass. It disables the accepted pipeline, template validation, amide
+checks, terminal RMSD calculation, clash checks, cap merging, relaxation, and
+affinity scoring. Each target directory contains:
+
+- `target.pdb`: the fixed receptor conformer;
+- `raw_model_outputs/<sample>.pt`: the literal sampled tensors and metadata;
+- `raw_model_outputs/<sample>.json`: human-readable provenance;
+- `conditioning_conformers/<sample>.sdf`: the terminal-conditioning conformer;
+- `<sample>.pdb` and `<sample>.sdf`: best-effort structural serialization of the
+  raw sample, with no acceptance filter.
+
+If structural serialization fails, its `.pt` and `.json` files remain and the
+attempt is not replaced. Use a new output directory for each controlled run; the
+wrapper refuses to mix a run with existing files.
+
 ## Output Layout
 
 For each template, PepAny writes one run directory:
@@ -336,4 +366,3 @@ Backend choices:
 `torch_num_threads` limits PyTorch CPU threads inside each worker. Keeping it at `1` avoids oversubscribing CPU cores when multiple workers are running.
 
 For many GPU workloads, increasing `batch_size` is more beneficial than process-based prefetching. If `max_sampling_number` is set, prefetching is disabled to preserve the exact attempt limit.
-

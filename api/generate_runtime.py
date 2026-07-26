@@ -22,6 +22,7 @@ from . import generation_postprocess as _generation_postprocess
 from . import generation_prefetch as _generation_prefetch
 from . import generation_progress as _generation_progress
 from . import generation_resume as _generation_resume
+from . import generation_raw as _generation_raw
 from . import generation_sanitize as _generation_sanitize
 
 from .generation_cli import parse
@@ -67,6 +68,7 @@ from .generation_resume import (
     _resume_previous_dir,
     build_pipeline_resume_state,
 )
+from .generation_raw import save_raw_attempt
 from .generation_sanitize import (
     _sanitize_options,
     sanitize_pipeline_accepted_dir,
@@ -80,6 +82,7 @@ _HELPER_MODULES = (
     _generation_pipeline,
     _generation_postprocess,
     _generation_resume,
+    _generation_raw,
     _generation_sanitize,
     _generation_progress,
 )
@@ -107,12 +110,16 @@ def generate_for_one_template(
         prefetch_opt=None,
         prefetch_seed=None,
         postprocess_opt=None,
+        raw_sampling_opt=None,
+        run_name=None,
     ):
     pipeline_opt = {} if pipeline_opt is None else dict(pipeline_opt)
     resume_state = {} if resume_state is None else dict(resume_state)
     amide_check_opt = {} if amide_check_opt is None else dict(amide_check_opt)
     prefetch_opt = {} if prefetch_opt is None else dict(prefetch_opt)
     postprocess_opt = {} if postprocess_opt is None else dict(postprocess_opt)
+    raw_sampling_opt = {} if raw_sampling_opt is None else dict(raw_sampling_opt)
+    raw_sampling_enabled = _option_enabled(raw_sampling_opt)
     accepted_dir = resolve_pipeline_accepted_dir(save_dir, pipeline_opt)
     if _option_enabled(pipeline_opt):
         os.makedirs(accepted_dir, exist_ok=True)
@@ -155,6 +162,8 @@ def generate_for_one_template(
     stats_path = _generation_stats_path(save_dir, resume_state.get('results_name', 'results.jsonl'))
     tmp_save_dir = os.path.join(save_dir, resume_state.get('tmp_dir_name', 'tmp'))
     n_cycles = 1 if dataset.config.name == 'Molecule' else 0    # at least reconstruct once for small molecules to rectify geometry
+    if raw_sampling_enabled and n_cycles:
+        raise ValueError('raw_sampling is currently supported only for peptide/antibody templates')
     accepted_tmp_dir = _pipeline_tmp_dir(accepted_dir, resume_state)
 
     prefetch_num_workers = int(prefetch_opt.get('num_workers', 0))
@@ -238,6 +247,28 @@ def generate_for_one_template(
                         if n == 0 or not os.path.exists(pocket_path):
                             complex_to_pdb(cplx_desc.cplx, pocket_path, cplx_desc.tgt_chains)
 
+                        raw_artifacts = {}
+                        if raw_sampling_enabled:
+                            raw_artifacts = save_raw_attempt(
+                                target_dir=target_dir,
+                                cplx_desc=cplx_desc,
+                                sample_index=n,
+                                model_output={
+                                    'S': batch_S[i],
+                                    'X': batch_X[i],
+                                    'A': batch_A[i],
+                                    'll': batch_ll[i],
+                                    'inter_bonds': batch_inter_bonds[i],
+                                    'intra_bonds': batch_intra_bonds[i],
+                                },
+                                sample_opt=sample_opt,
+                                run_name=run_name or dataset.config.name,
+                                pocket_threshold=dataset.pocket_threshold,
+                                copy_conditioning_conformer=raw_sampling_opt.get(
+                                    'copy_conditioning_conformer', True
+                                ),
+                            )
+
                         tasks.append({
                             'item_idx': item_idx,
                             'n': n,
@@ -254,12 +285,13 @@ def generate_for_one_template(
                             'pocket_path': pocket_path,
                             'out_path': out_path,
                             'check_validity': dataset.config.name == 'Molecule',
-                            'check_filters': True,
-                            'final_cycle': True,
+                            'check_filters': not raw_sampling_enabled,
+                            'final_cycle': not raw_sampling_enabled,
                             'amide_check_opt': amide_check_opt,
                             'pipeline_opt': pipeline_opt,
                             'pipeline_enabled': _option_enabled(pipeline_opt) and recorder.accepts_more(item_idx),
                             'accepted_tmp_dir': str(accepted_tmp_dir),
+                            'extra_details': raw_artifacts,
                         })
 
                     for result in _run_postprocess_tasks(tasks, postprocess_executor):
@@ -460,6 +492,7 @@ def _template_construct_config(template):
             'sanitize',
             'santinize',
             'resume_generation',
+            'raw_sampling',
         ):
         template_config.pop(key, None)
     return template_config
@@ -469,6 +502,12 @@ def _merge_pipeline_options(config, template):
     pipeline_opt = dict(config.get('pipeline', {}) or {})
     pipeline_opt.update(dict(template.pop('pipeline', {}) or {}))
     return pipeline_opt
+
+
+def _merge_raw_sampling_options(config, template):
+    raw_sampling_opt = dict(config.get('raw_sampling', {}) or {})
+    raw_sampling_opt.update(dict(template.pop('raw_sampling', {}) or {}))
+    return raw_sampling_opt
 
 
 def _resolve_goal_samples(config, template, pipeline_opt):
@@ -541,8 +580,20 @@ def main(args, opt_args):
 
     for template_idx, template in enumerate(templates):
         template = dict(template)
+        raw_sampling_opt = _merge_raw_sampling_options(config, template)
+        raw_sampling_enabled = _option_enabled(raw_sampling_opt)
         pipeline_opt = _merge_pipeline_options(config, template)
         run_name = _template_run_name(template, template_idx, class_counts)
+        if raw_sampling_enabled and _option_enabled(pipeline_opt):
+            print_log(
+                f'{run_name}: raw sampling disables the accepted/filtering pipeline.',
+                level='WARN',
+            )
+            pipeline_opt['enabled'] = False
+            pipeline_opt['merge'] = False
+        if raw_sampling_enabled:
+            for key in ('goal_num', 'goal_number', 'target_num'):
+                pipeline_opt.pop(key, None)
         if _option_enabled(pipeline_opt) and not _template_uses_capping(template):
             print_log(
                 f'{run_name}: capping=false disables the accepted cyclic pipeline; '
@@ -562,6 +613,20 @@ def main(args, opt_args):
         dataset = PDBDataset(**config['dataset'], template_config=R.construct(_template_construct_config(template)))
         n_inputs = len(dataset.pdb_paths)
         max_sampling = _resolve_max_sampling(max_sampling_config, pipeline_opt, n_samples, n_inputs)
+        if raw_sampling_enabled:
+            exact_attempts = n_samples * n_inputs
+            if max_sampling is not None and max_sampling != exact_attempts:
+                print_log(
+                    f'{run_name}: raw sampling uses exactly {exact_attempts} attempts '
+                    f'({n_samples} per target); ignoring max_sampling={max_sampling}.',
+                    level='WARN',
+                )
+            max_sampling = exact_attempts
+            print_log(
+                f'Raw sampling enabled: exactly {n_samples} attempts per target; '
+                'template, amide, terminal RMSD, clash, merge, relax, and scoring checks are disabled.',
+                level='INFO',
+            )
         resume_state = None
         if _option_enabled(pipeline_opt):
             if getattr(dataset.config, 'term_rel_pos_sampler', None) is None:
@@ -627,6 +692,8 @@ def main(args, opt_args):
             prefetch_opt=prefetch_opt,
             prefetch_seed=seed + template_idx * 10000019,
             postprocess_opt=postprocess_opt,
+            raw_sampling_opt=raw_sampling_opt,
+            run_name=run_name,
         )
 
 

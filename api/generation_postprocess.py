@@ -120,6 +120,9 @@ def _postprocess_candidate_worker(task):
         if cplx_desc is None:
             return {'item_idx': item_idx, 'n': n, 'log': None}
 
+        if details is not None:
+            details.update(task.get('extra_details', {}))
+
         if task.get('final_cycle', True):
             details = reject_implausible_ligand_amides(
                 cplx_desc,
