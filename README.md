@@ -44,8 +44,8 @@ Generation is controlled by a YAML file. A minimal configuration that generate l
 ```yaml
 dataset:
   pdb_path: ./api/CPtest/target_with_reference_ligand.pdb
-  tgt_chains: R # target chains used as receptor
-  lig_chains: L # reference ligand chain used for define pocket
+  tgt_chains: R # target chains used as receptor, multiple chains can be specified via the format of [A,B,C]
+  lig_chains: L # reference ligand chain used for define pocket, multiple chains can be specified via the format of [A,B,C]
   pocket_threshold: 10.0 # receptor residues within this distance from ligand are used as pocket
 
 templates:
