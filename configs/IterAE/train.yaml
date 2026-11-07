@@ -1,21 +1,21 @@
 dataset:
   train:
     class: DynamicCIFDataset
-    cif_dir: /home/fit/liulei/WORK/CPSea2.0_PDB/Clusters_PDB70 
-    cif_list: /home/fit/liulei/WORK/CPSea2.0_PDB/train_all_members.txt
-    cluster: /home/fit/liulei/WORK/CPSea2.0_PDB/reformatted_cluster_info.tsv
-    ligand_ids_tsv: /home/fit/liulei/WORK/CPSea2.0_PDB/ligand_ids.tsv
+    cif_dir: ./datasets/CPSea2.0_PDB/Clusters_PDB70
+    cif_list: ./datasets/CPSea2.0_PDB/train_all_members.txt
+    cluster: ./datasets/CPSea2.0_PDB/reformatted_cluster_info.tsv
+    ligand_ids_tsv: ./datasets/CPSea2.0_PDB/ligand_ids.tsv
     use_precomputed_distances: true
-    precomputed_distances_dir: /home/fit/liulei/WORK/CPSea2.0_PDB/Clusters_PDB70_Distances
+    precomputed_distances_dir: ./datasets/CPSea2.0_PDB/Clusters_PDB70_Distances
     pocket_th_min: 10.0
     pocket_th_max: 20.0
   valid:
     class: DynamicCIFDataset
-    cif_dir: /home/fit/liulei/WORK/CPSea2.0_PDB/Clusters_PDB70
-    cif_list: /home/fit/liulei/WORK/CPSea2.0_PDB/valid_selected_members.txt
-    ligand_ids_tsv: /home/fit/liulei/WORK/CPSea2.0_PDB/ligand_ids.tsv
+    cif_dir: ./datasets/CPSea2.0_PDB/Clusters_PDB70
+    cif_list: ./datasets/CPSea2.0_PDB/valid_selected_members.txt
+    ligand_ids_tsv: ./datasets/CPSea2.0_PDB/ligand_ids.tsv
     use_precomputed_distances: true
-    precomputed_distances_dir: /home/fit/liulei/WORK/CPSea2.0_PDB/Clusters_PDB70_Distances
+    precomputed_distances_dir: ./datasets/CPSea2.0_PDB/Clusters_PDB70_Distances
 
 dataloader:
   train:
@@ -39,7 +39,7 @@ trainer:
     warmup: 2000 # gradually increasing KL divergence for training stability (8 A800 GPUs)
     metric_min_better: true
     proj_name: PepAny # for wandb
-    logger: tensorboard # if you want to use wandb, please comment this line 
+    logger: tensorboard # if you want to use wandb, please comment this line
 
     optimizer:
       class: AdamW
@@ -56,7 +56,7 @@ trainer:
 model:
   class: CondIterAutoEncoder
   cfg_dropout_ratio: 0.2
-  guidance_scale: 1.5 
+  guidance_scale: 1.5
   encoder_type: EPT
   decoder_type: EPT
   embed_size: 512

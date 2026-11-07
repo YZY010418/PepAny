@@ -1,15 +1,24 @@
-__pycache__
+# Local system and Python artifacts
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+!.env.example
 
-wandb
-
-ckpts
-
-runs
-
-tmp
-
-datasets
-
-checkpoints
-
-*.cif
+# Model weights, datasets, and generated outputs
+/checkpoints/
+/ckpts/
+/datasets/
+/outputs/
+/runs/
+/wandb/
+/tmp/
+/tmp_*/
+/api/CPtest/
+/api/CPcap/
+/evaluation/CFGScaleScan/
+*.ckpt
+*.log

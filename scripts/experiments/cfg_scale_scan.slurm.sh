@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH -J PepAny_CFG_Scan
 #SBATCH -N 1
-#SBATCH -p a01
 #SBATCH -o CFGScan_stdout_%A_%a.log
 #SBATCH -e CFGScan_stderr_%A_%a.log
 #SBATCH --no-requeue
@@ -11,7 +10,7 @@
 
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-source /WORK/PUBLIC/liulei_work/miniconda3/bin/activate
+source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate PepAny
 
 set -Eeuo pipefail
@@ -26,8 +25,8 @@ case "$TASK_ID" in
         ;;
 esac
 
-REPO_ROOT="${REPO_ROOT:-/home/fit/liulei/WORK/PepAny}"
-BASE_CONFIG="${BASE_CONFIG:-${REPO_ROOT}/api/config1.yaml}"
+REPO_ROOT="${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+BASE_CONFIG="${BASE_CONFIG:-${REPO_ROOT}/api/demo/config.yaml}"
 CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/checkpoints/pepany_v1.ckpt}"
 CPCAP_ROOT="${CPCAP_ROOT:-${REPO_ROOT}/api/CPcap}"
 CPTEST_DIR="${CPTEST_DIR:-${REPO_ROOT}/api/CPtest}"

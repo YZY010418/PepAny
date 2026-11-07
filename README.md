@@ -19,33 +19,84 @@ conda activate PepAny
 Please download our pretrained weights by
 
 ```bash
-mkdir checkpoints
+mkdir -p checkpoints
 wget -c "https://zenodo.org/records/20080102/files/pepany_v1.ckpt?download=1" -O checkpoints/pepany_v1.ckpt
 ```
 
-Then pass it to generation with `--ckpt`.
+The public [Zenodo record](https://zenodo.org/records/20080102) distributes
+`pepany_v1.ckpt` (423,133,434 bytes) under **CC BY 4.0**. Its published MD5 is
+`3618257f08b99d1aac685247ed00af73`. The code license is separately MIT; see [LICENSE](LICENSE).
+Pass the downloaded checkpoint to generation with `--ckpt`.
 
 ## Quick Start
 
-Run peptide generation with the demo config:
+Run all commands from the repository root. Extract the bundled target examples,
+then run the linear-peptide example (no terminal-cap library required):
 
 ```bash
+tar -xzf api/CPtest.tar.gz -C api
 python -m api.generate \
-  --config api/demo/config.yaml \
+  --config api/demo/linear.yaml \
   --ckpt checkpoints/pepany_v1.ckpt \
   --save_dir outputs/demo \
   --gpu 0
 ```
 
+### Download CPcap for cyclic peptide generation
+
+CPcap is publicly available in the [CPSea2 dataset on Hugging Face](https://huggingface.co/datasets/YZY010418/CPSea2/tree/main/CPcap)
+under **CC BY 4.0**. It is distributed separately from this repository and the
+PepAny checkpoint. Download the eight conformer archives used by
+`api/demo/config.yaml` and extract them into the paths expected by that config.
+Run this Bash block from the repository root:
+
+```bash
+set -e
+HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+for topology in Alkene-A Amide-A Disulfide-A Ester-A ThioEther-A ThioEther-B ThioEther-C Triazole-A; do
+  archive="api/CPcap/CPcap_${topology}_Conformers.tar.gz"
+  destination="api/CPcap/${topology}/accepted_energy_filtered_sdf"
+  mkdir -p "$destination"
+  curl --fail --location --retry 3 \
+    "${HF_ENDPOINT}/datasets/YZY010418/CPSea2/resolve/main/CPcap/CPcap_${topology}/CPcap_${topology}_Conformers.tar.gz" \
+    --output "$archive"
+  tar -xzf "$archive" --strip-components=1 -C "$destination"
+done
+```
+
+The archives contain a top-level `CPcap_<topology>_Conformers/` directory;
+`--strip-components=1` places the SDF files directly in the configured directory,
+for example `api/CPcap/Amide-A/accepted_energy_filtered_sdf/*.sdf`.
+The downloaded library is ignored by Git. If Hugging Face is unreachable from
+your network, you can set `HF_ENDPOINT` to an accessible mirror before running
+the block (for example, `export HF_ENDPOINT=https://hf-mirror.com`).
+
+After downloading the checkpoint and extracting the target examples as above:
+
+```bash
+python -m api.generate \
+  --config api/demo/config.yaml \
+  --ckpt checkpoints/pepany_v1.ckpt \
+  --save_dir outputs/cyclic_demo \
+  --gpu 0
+```
+
+Set a finite `max_sampling_number` in each template for bounded runs; the demo's
+`null` budget continues until its acceptance goal is reached. For custom cap
+libraries, update both the SDF paths and terminal atom indices in the config.
+
+Training configurations under `configs/` are templates. Their
+`datasets/CPSea2.0_PDB` paths require separately prepared training data.
+
 ## Input Config
 
-Generation is controlled by a YAML file. A minimal configuration that generate linear peptide binders looks like:
+Generation is controlled by a YAML file. A minimal configuration for linear peptide binders looks like:
 
 ```yaml
 dataset:
-  pdb_path: ./api/CPtest/target_with_reference_ligand.pdb
-  tgt_chains: R # target chains used as receptor, multiple chains can be specified via the format of [A,B,C]
-  lig_chains: L # reference ligand chain used for define pocket, multiple chains can be specified via the format of [A,B,C]
+  pdb_path: ./api/CPtest/B_G_pdb4gba_renamed.pdb
+  tgt_chains: R # receptor chains; use [A, B, C] for multiple chains
+  lig_chains: L # reference ligand chains defining the pocket; use [A, B, C] for multiple chains
   pocket_threshold: 10.0 # receptor residues within this distance from ligand are used as pocket
 
 templates:
@@ -87,7 +138,8 @@ templates:
   - name: linear_peptide_uncapped
     class: Peptide
     capping: false
-    size_from_ligand: true
+    size_min: 8
+    size_max: 13
 
 n_samples: 10
 seed: 12
@@ -155,7 +207,7 @@ templates:
 Important fields:
 
 - `goal_num`: number of accepted structures required *for each target*.
-- `max_sampling_number`: maximum number of candidate generations before stopping. Use `null` for no fixed budget (i.e., infinite samping until satisfying the goal_num).
+- `max_sampling_number`: maximum number of candidate generations before stopping. Use `null` for no fixed budget (i.e., infinite sampling until satisfying the goal_num).
 - `sampling_mode`: with_replacement means terminal conformers may be reused. without_replacement means terminal conformers are shuffled and consumed without reuse.
 - `rmsd_cutoff`: terminal cap alignment cutoff used by the accepted pipeline.
 - `clash_threshold`: receptor clash distance threshold.
@@ -230,6 +282,95 @@ affinity scoring. Each target directory contains:
 If structural serialization fails, its `.pt` and `.json` files remain and the
 attempt is not replaced. Use a new output directory for each controlled run; the
 wrapper refuses to mix a run with existing files.
+
+Evaluate the transferred raw attempts on a CPU node with:
+
+```bash
+python scripts/experiments/evaluate_pepany_raw_geometry.py \
+  --input outputs/cptest_raw \
+  --workers 0 \
+  --expected-attempts-per-target 100
+```
+
+The default 1 Angstrom cutoffs are applied separately to the absolute terminal
+CA-distance error and the Kabsch-aligned terminal 10-atom RMSD. Reports are
+written under `<input>/geometry_evaluation`; no structures are copied by
+default. Each raw metadata JSON remains in the success-rate denominator even if
+its candidate SDF is missing or invalid. The evaluator is self-contained and
+does not import other PepAny modules; it only requires Python, NumPy, and RDKit
+(`tqdm` is optional).
+
+To additionally compare every raw candidate with every capping conformer of its
+cyclization type, point the evaluator to the CPcap root:
+
+```bash
+python scripts/experiments/evaluate_pepany_raw_geometry.py \
+  --input outputs/cptest_raw \
+  --capping-library-root api/CPcap \
+  --workers 0
+```
+
+For each run name, the evaluator recursively reads SDFs below
+`<capping-library-root>/<run_name>`. A custom mapping can be supplied when a run
+name and library directory differ:
+
+```bash
+--capping-library Amide-A=/path/to/amide/conformers \
+--capping-library Disulfide-A=/path/to/disulfide/conformers
+```
+
+The library results separately report whether any conformer passes the CA
+criterion, whether any conformer passes the 10-atom RMSD criterion, and whether
+one same conformer passes both. Conformers below the 10-atom RMSD cutoff are
+tried in increasing-RMSD order: the evaluator aligns and merges each CPcap
+structure into the raw peptide and checks nonlocal heavy-atom clashes, stopping
+as soon as it finds a clash-free option. An attempt passes
+`library_align_no_clash_pass` when at least one RMSD-passing conformer produces a
+clash-free merge. By default, a clash is a distance at or below
+`0.8 * (vdw_radius_1 + vdw_radius_2)`; change the scale with
+`--clash-threshold`. Atom pairs separated by at most three bonds are excluded.
+The summary reports both the align+no-clash rate over all raw attempts and the
+no-clash rate among attempts that passed the any-library RMSD criterion. The
+per-attempt report also records the minimum errors, conformer counts, merge
+errors, and best-matching conformer paths.
+
+For success-rate and failure-mode breakdowns by cyclization type and generated
+peptide length, add:
+
+```bash
+--grouped-success-rates
+```
+
+This writes `per_cyclization_summary.csv`, `per_length_summary.csv`, and
+`per_cyclization_length_summary.csv`. Peptide length is the number of generated
+core amino-acid residues after excluding the synthetic ACE/NME caps. Each table
+includes the conditioned and any-library success rates, together with mutually
+exclusive failure-mode counts such as CA-only, RMSD-only, neither, and—for the
+library evaluation—cases where the two metrics pass only against different
+conformers.
+
+To create a reconstruction-ready subset containing attempts that pass both
+criteria:
+
+```bash
+python scripts/experiments/evaluate_pepany_raw_geometry.py \
+  --input outputs/cptest_raw \
+  --workers 0 \
+  --copy-passed-to outputs/cptest_raw_geometry_passed \
+  --copy-criterion both
+```
+
+`--copy-criterion` accepts `ca`, `10atom`, or `both` for the sampled conditioning
+conformer, and `library-ca`, `library-10atom`, or `library-both` for the
+any-conformer comparison. Use `library-align-no-clash` to select attempts with
+at least one RMSD-passing, clash-free merged conformer. The default is `both`.
+This copies each selected candidate PDB/SDF, its conditioning conformer, target,
+and raw metadata while preserving the run/target directory layout. For example,
+an input at `ThioEther-C/target_1/raw_model_outputs/7.json` is copied below the
+same `ThioEther-C/target_1/` path in the new root. A library-based selection also
+copies the corresponding best library conformer under
+`matching_library_conformers/`. Add `--include-raw-tensors` only when the larger
+`.pt` model outputs are also needed.
 
 ## Output Layout
 
@@ -366,3 +507,49 @@ Backend choices:
 `torch_num_threads` limits PyTorch CPU threads inside each worker. Keeping it at `1` avoids oversubscribing CPU cores when multiple workers are running.
 
 For many GPU workloads, increasing `batch_size` is more beneficial than process-based prefetching. If `max_sampling_number` is set, prefetching is disabled to preserve the exact attempt limit.
+
+## Restore Flattened Relaxed Ligand Chains
+
+If a relaxation/export step has flattened chain `L` into a single `LIG`
+residue, restore its `CAP` and amino-acid identities with:
+
+```bash
+python scripts/restore_relaxed_l_chain.py \
+  --relaxed-dir /path/to/relaxed \
+  --metadata-dir /path/to/pepany_cptest_amide_library_accepted/metadata \
+  --workers 16 \
+  -o /path/to/restored
+```
+
+The script recursively matches `*_relaxed.pdb` files to metadata by
+cyclization type, target subfolder, and sample number. It automatically
+supports PepAny raw PDBs, CPcomposer raw PDBs whose metadata records two
+removed terminal placeholder residues, and BoltzGen raw `.cif`/`.cif.gz`
+files. For BoltzGen it reads `evaluation.peptide_chain` and applies the
+condition-specific core-residue rule used during cap assembly. If recorded
+absolute paths have moved, point to their new roots:
+
+```bash
+python scripts/restore_relaxed_l_chain.py \
+  --relaxed-dir /path/to/relaxed \
+  --metadata-dir /path/to/accepted/metadata \
+  --raw-dir /path/to/raw_outputs \
+  --merged-dir /path/to/accepted/complexes \
+  --accepted-output-dir /path/to/accepted_restored
+```
+
+Outputs go to `<relaxed-dir>_restored/` by default, together with
+`restoration_report.json`. With `-o`, the complete directory tree relative to
+`--relaxed-dir` is preserved below the selected output root. When
+`--accepted-output-dir` is provided, the unrelaxed accepted PDB is restored
+with the exact same peptide/CAP heavy-atom identities and written to the
+second output tree, allowing direct name-based pre/post-relaxation RMSD
+comparisons. `--workers 0`
+automatically uses up to eight CPU processes, `--workers N` selects an explicit
+process count, and `--workers 1` runs serially. Coordinates are not changed.
+Atom records are grouped by residue, atom serials and `CONECT` references are
+updated together, and any missing ligand connectivity is copied from the
+unrelaxed merged structure. Use `--pattern '*.pdb'` when relaxed files do not
+end in `_relaxed.pdb`. Metadata loading, source indexing, job preparation, and
+restoration have progress indicators; rich progress bars use `tqdm` when it is
+installed, with periodic text progress as the fallback.

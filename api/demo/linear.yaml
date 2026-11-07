@@ -1,0 +1,17 @@
+# Run from the repository root after extracting api/CPtest.tar.gz.
+dataset:
+  pdb_path: ./api/CPtest/B_G_pdb4gba_renamed.pdb
+  tgt_chains: R
+  lig_chains: L
+  pocket_threshold: 10.0
+
+templates:
+  - name: linear_peptide
+    class: Peptide
+    capping: true
+    size_min: 8
+    size_max: 13
+
+n_samples: 10
+seed: 12
+batch_size: 10
