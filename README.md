@@ -24,11 +24,6 @@ mkdir -p checkpoints
 wget -c "https://zenodo.org/records/20080102/files/pepany_v1.ckpt?download=1" -O checkpoints/pepany_v1.ckpt
 ```
 
-The public [Zenodo record](https://zenodo.org/records/20080102) distributes
-`pepany_v1.ckpt` (423,133,434 bytes) under **CC BY 4.0**. Its published MD5 is
-`3618257f08b99d1aac685247ed00af73`. The code license is separately MIT; see [LICENSE](LICENSE).
-Pass the downloaded checkpoint to generation with `--ckpt`.
-
 ## Quick Start
 
 Run all commands from the repository root. Extract the bundled target examples,
@@ -45,8 +40,7 @@ python -m api.generate \
 
 ### Cyclic peptides: download CPcap
 
-CPcap is publicly available in the [CPSea2 dataset on Hugging Face](https://huggingface.co/datasets/YZY010418/CPSea2/tree/main/CPcap)
-under **CC BY 4.0**. It is distributed separately from this repository and the
+CPcap is publicly available in the [CPSea2 dataset on Hugging Face](https://huggingface.co/datasets/YZY010418/CPSea2/tree/main/CPcap). It is distributed separately from this repository and the
 PepAny checkpoint. Download the eight conformer archives used by
 `api/demo/config.yaml` and extract them into the paths expected by that config.
 Run this Bash block from the repository root:
